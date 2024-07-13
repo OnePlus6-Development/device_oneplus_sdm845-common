@@ -199,6 +199,7 @@ PRODUCT_PACKAGES += \
     libqdMetaData.system \
     memtrack.sdm845 \
     vendor.display.config@1.9.vendor \
+    libtinyxml \
     vendor.display.config@2.0 \
     vendor.display.config@2.0.vendor \
     vendor.qti.hardware.display.allocator-service \
@@ -208,6 +209,8 @@ PRODUCT_PACKAGES += \
     vendor.qti.hardware.display.mapper@2.0.vendor \
     vendor.qti.hardware.display.mapper@3.0.vendor \
     vendor.qti.hardware.display.mapper@4.0.vendor
+    vendor.qti.hardware.display.mapperextensions@1.0.vendor \
+    vendor.qti.hardware.memtrack-service
 
 # Doze
 PRODUCT_PACKAGES += \
