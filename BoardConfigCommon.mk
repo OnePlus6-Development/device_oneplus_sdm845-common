@@ -63,7 +63,7 @@ TARGET_KERNEL_SOURCE := kernel/oneplus/sdm845
 
 # Platform
 BOARD_USES_QCOM_HARDWARE := true
-TARGET_BOARD_PLATFORM := sdm845
+TARGET_BOARD_PLATFORM := sdm845next
 
 # Properties
 TARGET_ODM_PROP += $(COMMON_PATH)/odm.prop
