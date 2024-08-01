@@ -385,6 +385,9 @@ PRODUCT_SOONG_NAMESPACES += \
     hardware/qcom-caf/common/libqti-perfd-client \
     vendor/qcom/opensource/usb/etc
 
+QCOM_SOONG_NAMESPACE := \
+    $(LOCAL_PATH)/oss-hals
+
 # Telephony
 PRODUCT_PACKAGES += \
     ims-ext-common \
