@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+DERP_BUILDTYPE=unofficial
+DERP_VERSION_APPEND_TIME_OF_DAY=true
+#EXTRA_UDFPS_ICONS=true
+TARGET_USES_PICO_GAPPS=true
+TARGET_NOT_USES_BLUR=true
 
 # Add common definitions for Qualcomm
 $(call inherit-product, hardware/qcom-caf/common/common.mk)
