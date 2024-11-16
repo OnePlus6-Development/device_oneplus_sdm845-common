@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 - 2013, 2015, 2018 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012 - 2013, 2015, 2018, 2020 The Linux Foundation. All rights reserved.
  *
  * redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -55,8 +55,8 @@
 #define ALIGN512 512
 #define ALIGN256 256
 #define ALIGN128 128
-#define ALIGN64 64
 #define ALIGN32 32
+#define ALIGN64 64
 #define ALIGN16 16
 
 #define ADRENO_PIXELFORMAT_R8G8B8A8 28
@@ -114,7 +114,8 @@ enum ColorConvertFormat {
     NV12_UBWC,
     TP10_UBWC,
     YCbCr420_VENUS_P010,
-    CbYCrY,
+    P010,
+    VENUS_P010,
     NO_COLOR_FORMAT
 };
 
@@ -172,6 +173,7 @@ class C2DColorConverter{
   size_t mDstSize;
   size_t mSrcYSize;
   size_t mDstYSize;
+  C2D_TARGET_CONFIG mRotation;
   ColorConvertFormat mSrcFormat;
   ColorConvertFormat mDstFormat;
   int32_t mFlags;
@@ -195,6 +197,7 @@ class C2DColorConverter{
                      size_t dstHeight, ColorConvertFormat srcFormat,
                      ColorConvertFormat dstFormat, int32_t flags,
                      size_t srcStride);
+  void setRotation(int32_t rotation);
   int32_t getBuffSize(int32_t port);
   bool getBuffFilledLen(int32_t port, unsigned int &filled_length);
   bool getBuffReq(int32_t port, C2DBuffReq *req);
@@ -202,6 +205,7 @@ class C2DColorConverter{
   bool convertC2D(int srcFd, void *srcBase, void * srcData,
                   int dstFd, void *dstBase, void * dstData);
   bool isYUVSurface(ColorConvertFormat format);
+  void ClearSurfaces();
   int32_t getDummySurfaceDef(ColorConvertFormat format, size_t width,
                              size_t height, bool isSource);
   C2D_STATUS updateYUVSurfaceDef(uint8_t *addr, void *base, void * data, bool isSource);

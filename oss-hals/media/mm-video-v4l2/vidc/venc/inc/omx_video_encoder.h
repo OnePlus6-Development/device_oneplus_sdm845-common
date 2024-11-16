@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2010-2017,2019 The Linux Foundation. All rights reserved.
+Copyright (c) 2010-2017, 2020 The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are
@@ -55,10 +55,10 @@ class omx_venc: public omx_video
         bool is_secure_session();
         //OMX strucutres
         OMX_U32 m_nVenc_format;
+        char m_platform_name[PROPERTY_VALUE_MAX] = {0};
         class venc_dev *handle;
         int dev_handle_output_extradata(void *, int);
         int dev_set_format(int);
-        bool dev_query_cap(struct v4l2_queryctrl &);
     private:
         OMX_U32 dev_stop(void);
         OMX_U32 dev_pause(void);
@@ -72,6 +72,8 @@ class omx_venc: public omx_video
         bool dev_free_buf( void *,unsigned);
         bool dev_empty_buf(void *, void *,unsigned,unsigned);
         bool dev_fill_buf(void *, void *,unsigned,unsigned);
+        bool dev_is_meta_mode(void);
+        bool dev_is_avtimer_needed(void);
         bool dev_buffer_ready_to_queue(OMX_BUFFERHEADERTYPE *buffer);
         bool dev_get_buf_req(OMX_U32 *,OMX_U32 *,OMX_U32 *,OMX_U32);
         bool dev_get_dimensions(OMX_U32 ,OMX_U32 *,OMX_U32 *);
@@ -85,7 +87,6 @@ class omx_venc: public omx_video
         bool dev_loaded_stop_done(void);
         bool dev_get_capability_ltrcount(OMX_U32 *, OMX_U32 *, OMX_U32 *);
         bool dev_get_vui_timing_info(OMX_U32 *);
-        bool dev_get_vqzip_sei_info(OMX_U32 *);
         bool dev_get_peak_bitrate(OMX_U32 *);
         bool dev_get_batch_size(OMX_U32 *);
         bool dev_get_temporal_layer_caps(OMX_U32 * /*nMaxLayers*/,
@@ -98,7 +99,7 @@ class omx_venc: public omx_video
         bool dev_get_output_log_flag();
         int dev_output_log_buffers(const char *buffer_addr,
                                    int buffer_len, uint64_t timestamp);
-        int dev_extradata_log_buffers(char *buffer, bool input);
+        int dev_extradata_log_buffers(char *buffer, int index, bool input);
         bool dev_get_hevc_profile(OMX_U32* profile);
         void dev_get_color_format_as_string(char * buf, int buf_len, unsigned colorformat);
         void dev_get_consumer_usage(OMX_U32* usage);

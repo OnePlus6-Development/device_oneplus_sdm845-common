@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2009-2017,2019 The Linux Foundation. All rights reserved.
+Copyright (c) 2009-2017, 2019, The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -445,8 +445,6 @@ enum OMX_QCOM_EXTN_INDEXTYPE
     /*"OMX.QCOM.index.param.VideoMaxAllowedBitrateCheck"*/
     OMX_QcomIndexParamVideoMaxAllowedBitrateCheck = 0x7F00001E,
 
-    OMX_QcomIndexEnableSliceDeliveryMode = 0x7F00001F,
-
     /* "OMX.QCOM.index.param.video.ExtnUserExtraData" */
     OMX_QcomIndexEnableExtnUserData = 0x7F000020,
 
@@ -563,11 +561,6 @@ enum OMX_QCOM_EXTN_INDEXTYPE
 
     OMX_QcomIndexParamVencAspectRatio = 0x7F000051,
 
-    OMX_QTIIndexParamVQZipSEIExtraData = 0x7F000052,
-
-    /* Enable VQZIP SEI NAL type */
-    OMX_QTIIndexParamVQZIPSEIType = 0x7F000053,
-
     OMX_QTIIndexParamPassInputBufferFd = 0x7F000054,
 
     /* Set Prefer-adaptive playback*/
@@ -628,9 +621,6 @@ enum OMX_QCOM_EXTN_INDEXTYPE
     /* Dither control for 10bit */
     OMX_QTIIndexParamDitherControl = 0x7F000069,
 
-    /* Suggest how big Iframe sizes should be */
-    OMX_QTIIndexParamIframeSizeType = 0x7F000070,
-
     /* use av-timer ticks as timestamp (used by VT-client) */
     OMX_QTIIndexParamEnableAVTimerTimestamps = 0x7F000071,
 
@@ -684,6 +674,9 @@ enum OMX_QCOM_EXTN_INDEXTYPE
     /* Enable Blur */
     OMX_QTIIndexParamVideoEnableBlur = 0x7F00007A,
 
+    /* Vbv Delay*/
+    OMX_QTIIndexParamVbvDelay = 0x7F00007B,
+
     /* Capabilities */
     OMX_QTIIndexParamCapabilitiesVTDriverVersion = 0x7F100000,
 
@@ -695,18 +688,17 @@ enum OMX_QCOM_EXTN_INDEXTYPE
 
     OMX_QTIIndexParamCapabilitiesRotationSupport = 0x7F100004,
 
-    OMX_QTIIndexParamCapabilitiesBlurSupport = 0x7F100005,
-
-    OMX_QTIIndexParamCapabilitiesColorSpaceConversionSupport = 0x7F100006,
+    OMX_QTIIndexParamNativeRecorder = 0x7F100005,
+    OMX_QTIIndexParamVideoDecoderOutputFrameRate = 0x7F100006,
 
     /* Configure Rectangle Region based ROI info */
     OMX_QTIIndexConfigVideoRoiRectRegionInfo = 0x7F100007,
 
-    OMX_QTIIndexParamNativeRecorder = 0x7F100008,
-
-    OMX_QTIIndexParamVideoDecoderOutputFrameRate = 0x7F100009,
     /*"OMX.google.android.index.describeHDR10PlusInfo"*/
-    OMX_QTIIndexConfigDescribeHDR10PlusInfo = 0x7F10000a,
+    OMX_QTIIndexConfigDescribeHDR10PlusInfo = 0x7F100008,
+
+    /* Configure Bitrate Savings (CAC) */
+    OMX_QTIIndexConfigContentAdaptiveCoding = 0x7F100009,
 };
 
 /**
@@ -1118,17 +1110,6 @@ typedef struct OMX_QCOM_VIDEO_PARAM_VUI_TIMING_INFO {
 
 /**
  * This structure describes the parameters corresponding
- * to OMX_QcomIndexParamVQZIPSEIType extension. It
- * will enable/disable the VQZIP SEI info.
- */
-typedef struct OMX_QTI_VIDEO_PARAM_VQZIP_SEI_TYPE {
-    OMX_U32 nSize;              /** Size of the structure in bytes */
-    OMX_VERSIONTYPE nVersion;   /** OMX specification version information */
-    OMX_BOOL bEnable;           /** Enable/disable the setting */
-} OMX_QTI_VIDEO_PARAM_VQZIP_SEI_TYPE;
-
-/**
- * This structure describes the parameters corresponding
  * to OMX_QcomIndexParamPeakBitrate extension. It will
  * set the peak bitrate specified by nPeakBitrate.
  */
@@ -1235,14 +1216,6 @@ typedef struct OMX_QCOM_CONFIG_INTERLACETYPE
 
 #define MAX_PAN_SCAN_WINDOWS 4
 
-#ifdef VENUS_USES_LEGACY_MISR_INFO
-typedef struct OMX_QCOM_MISR_INFO {
-	OMX_U32 misr_dpb_luma;
-	OMX_U32 misr_dpb_chroma;
-	OMX_U32 misr_opb_luma;
-	OMX_U32 misr_opb_chroma;
-} OMX_QCOM_MISR_INFO;
-#else
 typedef struct OMX_QCOM_MISR_INFO {
 	unsigned int misr_set;
 	unsigned int misr_dpb_luma[8];
@@ -1250,7 +1223,6 @@ typedef struct OMX_QCOM_MISR_INFO {
 	unsigned int misr_opb_luma[8];
 	unsigned int misr_opb_chroma[8];
 } OMX_QCOM_MISR_INFO;
-#endif
 
 typedef struct OMX_QCOM_OUTPUT_CROP {
     OMX_U32 size;
@@ -1380,11 +1352,6 @@ typedef struct OMX_QCOM_EXTRADATA_MBINFO
    OMX_U8  data[0];
 } OMX_QCOM_EXTRADATA_MBINFO;
 
-typedef struct OMX_QCOM_EXTRADATA_VQZIPSEI {
-    OMX_U32 nSize;
-    OMX_U8 data[0];
-} OMX_QCOM_EXTRADATA_VQZIPSEI;
-
 typedef struct OMX_QTI_VIDEO_PARAM_ENABLE_ROIINFO {
     OMX_U32         nSize;
     OMX_VERSIONTYPE nVersion;
@@ -1495,22 +1462,64 @@ typedef enum OMX_QCOM_EXTRADATATYPE
     OMX_ExtraDataQP =                      0x7F00000d,
     OMX_ExtraDataInputBitsInfo =           0x7F00000e,
     OMX_ExtraDataVideoEncoderMBInfo =      0x7F00000f,
-    OMX_ExtraDataVQZipSEI  =               0x7F000010,
     OMX_ExtraDataDisplayColourSEI =        0x7F000011,
     OMX_ExtraDataLightLevelSEI =           0x7F000012,
     OMX_ExtraDataOutputCropInfo =          0x7F000014,
     OMX_ExtraDataInputROIInfo =            0x7F000058,
 } OMX_QCOM_EXTRADATATYPE;
 
+/**
+ * Basic extradata includes:
+ *     decoder: output_crop, num_concealed_mb, interlaced_format,
+                vui_display_info, vpx_color, mpeg2_seqdisp, MLL, CLL
+       encoder: none
+   Others are advanced extradata, except encoder ROI
+ */
+typedef enum OMX_QTI_EXTRADATACATEGORY {
+    OMX_QTI_ExtraDataCategory_Basic =       1,
+    OMX_QTI_ExtraDataCategory_Advanced =    2,
+    OMX_QTI_ExtraDataCategory_Enc_ROI =     4,
+} OMX_QTI_EXTRADATA_ENABLE_TYPE;
+
+/**
+ * Below enums are used to indicate the type of each
+ * extradata packet in the extradata buffer.
+ */
+typedef enum OMX_QTI_VIDC_EXTRADATATYPE
+{
+    OMX_QTI_VIDC_ExtraData_None =                       0x00000000,
+    OMX_QTI_VIDC_ExtraData_InterlaceFormat =            0x00000002,
+    OMX_QTI_VIDC_ExtraData_Timestamp =                  0x00000005,
+    OMX_QTI_VIDC_ExtraData_FramePacking =               0x00000006,
+    OMX_QTI_VIDC_ExtraData_FrameRate =                  0x00000007,
+    OMX_QTI_VIDC_ExtraData_PanscanWindow =              0x00000008,
+    OMX_QTI_VIDC_ExtraData_RecoveryPointSEI =           0x00000009,
+    OMX_QTI_VIDC_ExtraData_Mpeg2SeqDisp =               0x0000000D,
+    OMX_QTI_VIDC_ExtraData_StreamUserData =             0x0000000E,
+    OMX_QTI_VIDC_ExtraData_FrameQP =                    0x0000000F,
+    OMX_QTI_VIDC_ExtraData_FrameBitsInfo =              0x00000010,
+    OMX_QTI_VIDC_ExtraData_VPXColorSpaceInfo =          0x00000014,
+    OMX_QTI_VIDC_ExtraData_MasteringDisplayColourSEI =  0x00000015,
+    OMX_QTI_VIDC_ExtraData_ContentLightLevelSEI =       0x00000016,
+    OMX_QTI_VIDC_ExtraData_UBWCStatInfo =               0x00000019,
+    OMX_QTI_VIDC_ExtraData_OutputCropInfo =             0x0700000F,
+    OMX_QTI_VIDC_ExtraData_ROIInfo =                    0x7F000058,
+    OMX_QTI_VIDC_ExtraData_NumConcealedMB =             0x7F100001,
+    OMX_QTI_VIDC_ExtraData_Index =                      0x7F100002,
+    OMX_QTI_VIDC_ExtraData_AspectRatio =                0x7F100003,
+    OMX_QTI_VIDC_ExtraData_LTRInfo =                    0x7F100004,
+    OMX_QTI_VIDC_ExtraData_VUIDisplayInfo =             0x7F100006,
+    OMX_QTI_VIDC_ExtraData_HDR10HIST =                  0x7F100008,
+} OMX_QTI_VIDC_EXTRADATATYPE;
+
 struct ExtraDataMap {
         const char *type;
-        OMX_QCOM_EXTRADATATYPE index;
+        OMX_QTI_VIDC_EXTRADATATYPE index;
 };
 static const struct ExtraDataMap kExtradataMap[] = {
-        { "ltrinfo", OMX_ExtraDataVideoLTRInfo },
-        { "mbinfo", OMX_ExtraDataVideoEncoderMBInfo },
-        { "outputcropinfo", OMX_ExtraDataOutputCropInfo },
-        { "roiinfo", OMX_ExtraDataInputROIInfo },
+        { "outputcropinfo", OMX_QTI_VIDC_ExtraData_OutputCropInfo },
+        { "ltrinfo", OMX_QTI_VIDC_ExtraData_LTRInfo },
+        { "concealmbinfo", OMX_QTI_VIDC_ExtraData_NumConcealedMB },
 };
 
 static inline OMX_S32 getIndexForExtradataType(char * type) {
@@ -1531,6 +1540,107 @@ static inline const char * getStringForExtradataType(int64_t index) {
     }
     return NULL;
 }
+
+/* Start of definitions are extradata payload structures for OMX_QTI_VIDC_EXTRADATATYPE */
+
+/* Below extradata types payload structure are currently not exposed
+ *  OMX_QTI_VIDC_ExtraData_Mpeg2SeqDisp
+ *  OMX_QTI_VIDC_ExtraData_VPXColorSpaceInfo
+ *  OMX_QTI_VIDC_ExtraData_VUIDisplayInfo
+ *  OMX_QTI_VIDC_ExtraData_MasteringDisplayColourSEI
+ *  OMX_QTI_VIDC_ExtraData_ContentLightLevelSEI
+ *  OMX_QTI_VIDC_ExtraData_UBWCStatInfo
+ *  OMX_QTI_VIDC_ExtraData_HDR10HIST
+ */
+
+typedef enum OMX_QTI_VIDC_INTERLACE_FORMATTYPE {
+    OMX_QTI_VIDC_InterlaceFrameProgressive =                   0x1,
+    OMX_QTI_VIDC_InterlaceInterleaveFrameTopFieldFirst =       0x2,
+    OMX_QTI_VIDC_InterlaceInterleaveFrameBottomFieldFirst =    0x4,
+    OMX_QTI_VIDC_InterlaceFrameTopFieldFirst =                 0x8,
+    OMX_QTI_VIDC_InterlaceFrameBottomFieldFirst =              0x10,
+    OMX_QTI_VIDC_InterlaceMBAFF =                              0x20,
+} OMX_QTI_VIDC_INTERLACE_FORMATTYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_INTERFACE_TYPE {
+    OMX_QTI_VIDC_INTERLACE_FORMATTYPE eInterlaceFormat;
+    OMX_U32 eColorFormat;
+} OMX_QTI_VIDC_EXTRADATA_INTERFACE_TYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_TIMESTAMP_TYPE {
+    OMX_U32 nTimeStampLow;    /**< Lower 32 bit value of the time stamp */
+    OMX_U32 nTimeStampHigh;   /**< Higher 32 bit value of the time stamp */
+} OMX_QTI_VIDC_EXTRADATA_TIMESTAMP_TYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_FRAMEPACKING_TYPE {
+    OMX_U32 id;
+    OMX_U32 cancel_flag;
+    OMX_U32 type;
+    OMX_U32 quincunx_sampling_flag;
+    OMX_U32 content_interpretation_type;
+    OMX_U32 spatial_flipping_flag;
+    OMX_U32 frame0_flipped_flag;
+    OMX_U32 field_views_flag;
+    OMX_U32 current_frame_is_frame0_flag;
+    OMX_U32 frame0_self_contained_flag;
+    OMX_U32 frame1_self_contained_flag;
+    OMX_U32 frame0_grid_position_x;
+    OMX_U32 frame0_grid_position_y;
+    OMX_U32 frame1_grid_position_x;
+    OMX_U32 frame1_grid_position_y;
+    OMX_U32 reserved_byte;
+    OMX_U32 repetition_period;
+    OMX_U32 extension_flag;
+} OMX_QTI_VIDC_EXTRADATA_FRAMEPACKING_TYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_FRAMERATE_TYPE {
+    OMX_U32 xFrameRate;     /* In Q16 format */
+} OMX_QTI_VIDC_EXTRADATA_FRAMERATE_TYPE;
+
+typedef struct OMX_QTI_VIDC_WINDOW
+{
+    OMX_S32 dx;
+    OMX_S32 dy;
+    OMX_S32 x;
+    OMX_S32 y;
+} OMX_QTI_VIDC_WINDOW;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_PANSCAN_TYPE
+{
+    OMX_U32 numWindows;
+    OMX_QTI_VIDC_WINDOW window[MAX_PAN_SCAN_WINDOWS];
+} OMX_QTI_VIDC_EXTRADATA_PANSCAN_TYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_RECOVERYSEI_TYPE {
+    OMX_U32 nFlag;     /* QOMX_VIDEO_RECOVERYSEITYPE */
+} OMX_QTI_VIDC_EXTRADATA_RECOVERYSEI_TYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_CONCEALMB_TYPE {
+    OMX_U32 nNumMBConcealed;
+} OMX_QTI_VIDC_EXTRADATA_CONCEALMB_TYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_LTRINFO_TYPE {
+    OMX_U32 nLTRInfo;
+} OMX_QTI_VIDC_EXTRADATA_LTRINFO_TYPE;
+
+typedef struct OMX_QCOM_EXTRADATA_USERDATA OMX_QTI_VIDC_EXTRADATA_USERDATA_TYPE;
+
+typedef struct OMX_QCOM_EXTRADATA_QP OMX_QTI_VIDC_EXTRADATA_FRAMEQP_TYPE;
+
+typedef struct OMX_QCOM_EXTRADATA_BITS_INFO OMX_QTI_VIDC_EXTRADATA_FRAMEBITS_TYPE;
+
+typedef struct OMX_QCOM_OUTPUT_CROP OMX_QTI_VIDC_EXTRADATA_OUTPUTCROP_TYPE;
+
+typedef struct OMX_QTI_VIDC_EXTRADATA_ASPECTRATIO_TYPE
+{
+    OMX_U32 nSize;
+    OMX_U32 nVersion;
+    OMX_U32 nPortIndex;
+    OMX_U32 aspectRatioX;
+    OMX_U32 aspectRatioY;
+} OMX_QTI_VIDC_EXTRADATA_ASPECTRATIO_TYPE;
+
+/* End of definitions for extradata payload structures for OMX_QTI_VIDC_EXTRADATATYPE */
 
 typedef struct  OMX_STREAMINTERLACEFORMATTYPE {
     OMX_U32 nSize;
@@ -1846,14 +1956,6 @@ typedef struct QOMX_VIDEO_OUTPUT_FRAME_RATE {
 
 #define OMX_QCOM_INDEX_PARAM_VIDEO_SYNCFRAMEDECODINGMODE "OMX.QCOM.index.param.video.SyncFrameDecodingMode"
 #define OMX_QCOM_INDEX_PARAM_INDEXEXTRADATA "OMX.QCOM.index.param.IndexExtraData"
-#define OMX_QCOM_INDEX_PARAM_VIDEO_SLICEDELIVERYMODE "OMX.QCOM.index.param.SliceDeliveryMode"
-#define OMX_QCOM_INDEX_PARAM_VIDEO_FRAMEPACKING_EXTRADATA "OMX.QCOM.index.param.video.FramePackingExtradata"
-#define OMX_QCOM_INDEX_PARAM_VIDEO_QP_EXTRADATA "OMX.QCOM.index.param.video.QPExtradata"
-#define OMX_QCOM_INDEX_PARAM_VIDEO_INPUTBITSINFO_EXTRADATA "OMX.QCOM.index.param.video.InputBitsInfoExtradata"
-#define OMX_QCOM_INDEX_PARAM_VIDEO_EXTNUSER_EXTRADATA "OMX.QCOM.index.param.video.ExtnUserExtraData"
-#define OMX_QCOM_INDEX_PARAM_VIDEO_EXTNOUTPUTCROP_EXTRADATA "OMX.QCOM.index.param.video.ExtnOutputCropExtraData"
-#define OMX_QCOM_INDEX_CONFIG_VIDEO_FRAMEPACKING_INFO "OMX.QCOM.index.config.video.FramePackingInfo"
-#define OMX_QCOM_INDEX_PARAM_VIDEO_MPEG2SEQDISP_EXTRADATA "OMX.QCOM.index.param.video.Mpeg2SeqDispExtraData"
 
 #define OMX_QCOM_INDEX_PARAM_VIDEO_HIERSTRUCTURE "OMX.QCOM.index.param.video.HierStructure"
 #define OMX_QCOM_INDEX_PARAM_VIDEO_LTRCOUNT "OMX.QCOM.index.param.video.LTRCount"
@@ -2037,6 +2139,13 @@ typedef struct QOMX_VIDEO_IFRAMESIZE {
    OMX_VERSIONTYPE nVersion;
    QOMX_VIDEO_IFRAMESIZE_TYPE eType;
 } QOMX_VIDEO_IFRAMESIZE;
+
+typedef struct OMX_EXTNINDEX_VIDEO_VBV_DELAY {
+    OMX_U32 nSize;
+    OMX_VERSIONTYPE nVersion;
+    OMX_U32 nPortIndex;
+    OMX_U32 nVbvDelay;
+ } OMX_EXTNINDEX_VIDEO_VBV_DELAY;
 
 /* VIDEO POSTPROCESSING CTRLS AND ENUMS */
 /* MUST KEEP SAME AS IN vpp.h */

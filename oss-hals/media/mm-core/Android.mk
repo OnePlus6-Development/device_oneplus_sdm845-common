@@ -8,20 +8,23 @@ OMXCORE_CFLAGS += -O0 -fno-inline -fno-short-enums
 OMXCORE_CFLAGS += -D_ANDROID_
 OMXCORE_CFLAGS += -U_ENABLE_QC_MSG_LOG_
 
+ifeq ($(VIDC_STUB_HAL),true)
+OMXCORE_CFLAGS += -DVIDC_STUB_HAL
+endif
+
 #===============================================================================
 #             Figure out the targets
 #===============================================================================
 
-ifeq ($(filter $(TARGET_BOARD_PLATFORM), msmnile),$(TARGET_BOARD_PLATFORM))
-OMXCORE_CFLAGS += -D_NILE_
+MPEGH_TARGET_LIST := kona lito bengal
+ifeq ($(call is-board-platform-in-list, $(MPEGH_TARGET_LIST)), true)
+OMXCORE_CFLAGS += -DAUDIO_MPEGH_ENABLED
+endif
+
+ifeq ($(filter $(TARGET_BOARD_PLATFORM), bengal),$(TARGET_BOARD_PLATFORM))
+OMXCORE_CFLAGS += -D_BENGAL_
 else ifeq ($(filter $(TARGET_BOARD_PLATFORM), $(MSMSTEPPE)),$(TARGET_BOARD_PLATFORM))
 OMXCORE_CFLAGS += -D_STEPPE_
-else ifeq ($(filter $(TARGET_BOARD_PLATFORM), $(TRINKET)),$(TARGET_BOARD_PLATFORM))
-OMXCORE_CFLAGS += -D_TRINKET_
-else ifeq ($(filter $(TARGET_BOARD_PLATFORM), atoll),$(TARGET_BOARD_PLATFORM))
-OMXCORE_CFLAGS += -D_ATOLL_
-else ifeq ($(filter $(TARGET_BOARD_PLATFORM), sdm845),$(TARGET_BOARD_PLATFORM))
-OMXCORE_CFLAGS += -D_SDM845_
 else
 OMXCORE_CFLAGS += -D_DEFAULT_
 endif
@@ -43,22 +46,32 @@ LOCAL_HEADER_LIBRARIES := \
 
 LOCAL_EXPORT_HEADER_LIBRARY_HEADERS := libomxcore_headers
 
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN), true)
+LOCAL_SANITIZE := integer_overflow
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN_DIAG), true)
+$(warning INTSAN_DIAG_ENABLED)
+LOCAL_SANITIZE_DIAG := integer_overflow
+endif
+endif
+
 LOCAL_PRELINK_MODULE    := false
 LOCAL_MODULE            := libOmxCore
 LOCAL_MODULE_TAGS       := optional
 LOCAL_VENDOR_MODULE     := true
 LOCAL_SHARED_LIBRARIES  := liblog libdl libcutils
 ifeq ($(call is-board-platform-in-list, $(MSM_VIDC_TARGET_LIST)),true)
+ifeq ($(VIDC_STUB_HAL),false)
 LOCAL_SHARED_LIBRARIES  += libplatformconfig
+endif
 endif
 LOCAL_CFLAGS            := $(OMXCORE_CFLAGS)
 
 LOCAL_SRC_FILES         := src/common/omx_core_cmp.cpp
 LOCAL_SRC_FILES         += src/common/qc_omx_core.c
-ifneq (,$(filter msmnile sdmshrike $(MSMSTEPPE) $(TRINKET) atoll sdm845,$(TARGET_BOARD_PLATFORM)))
+ifneq (,$(filter lito bengal kona $(MSMSTEPPE),$(TARGET_BOARD_PLATFORM)))
 LOCAL_SRC_FILES         += src/registry_table_android.c
 else
-LOCAL_SRC_FILES         += src/qc_registry_table_android.c
+LOCAL_SRC_FILES         += src/default/qc_registry_table_android.c
 endif
 
 include $(BUILD_SHARED_LIBRARY)
@@ -84,16 +97,26 @@ LOCAL_MODULE_TAGS       := optional
 LOCAL_VENDOR_MODULE     := true
 LOCAL_SHARED_LIBRARIES  := liblog libdl libcutils
 ifeq ($(call is-board-platform-in-list, $(MSM_VIDC_TARGET_LIST)),true)
+ifeq ($(VIDC_STUB_HAL),false)
 LOCAL_SHARED_LIBRARIES  += libplatformconfig
+endif
 endif
 LOCAL_CFLAGS            := $(OMXCORE_CFLAGS)
 
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN), true)
+LOCAL_SANITIZE := integer_overflow
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN_DIAG), true)
+$(warning INTSAN_DIAG_ENABLED)
+LOCAL_SANITIZE_DIAG := integer_overflow
+endif
+endif
+
 LOCAL_SRC_FILES         := src/common/omx_core_cmp.cpp
 LOCAL_SRC_FILES         += src/common/qc_omx_core.c
-ifneq (,$(filter msmnile sdmshrike $(MSMSTEPPE) $(TRINKET) atoll sdm845,$(TARGET_BOARD_PLATFORM)))
+ifneq (,$(filter lito bengal kona $(MSMSTEPPE),$(TARGET_BOARD_PLATFORM)))
 LOCAL_SRC_FILES         += src/$(MM_CORE_TARGET)/registry_table.c
 else
-LOCAL_SRC_FILES         += src/$(MM_CORE_TARGET)/qc_registry_table.c
+LOCAL_SRC_FILES         += src/$(MM_CORE_TARGET)/default/qc_registry_table.c
 endif
 
 include $(BUILD_SHARED_LIBRARY)

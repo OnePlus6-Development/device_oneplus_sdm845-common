@@ -21,17 +21,12 @@ libmm-venc-def += -USINGLE_ENCODER_INSTANCE
 libmm-venc-def += -Werror
 libmm-venc-def += -D_ANDROID_ICS_
 
+# KONA_TODO_UPDATE: Disable SW codec for kona for now
 TARGETS_THAT_USE_FLAG_MSM8226 := msm8226 msm8916 msm8909
 TARGETS_THAT_DONT_NEED_SW_VENC_MPEG4 := msm8226 msm8916 msm8992 msm8996 sdm660 msm8998
 TARGETS_THAT_DONT_SUPPORT_SW_VENC_ROTATION := msm8226 msm8916 msm8992 msm8996 sdm660 msm8998 msm8909 msm8937
-TARGETS_THAT_DONT_SUPPORT_SW_VENC_720P = atoll
 
 TARGETS_THAT_NEED_SW_VENC_HEVC := msm8992
-TARGETS_THAT_SUPPORT_VQZIP := msm8996 msm8998
-
-ifeq ($(call is-board-platform-in-list, $(TARGETS_THAT_DONT_SUPPORT_SW_VENC_720P)),true)
-libmm-venc-def += -DDISABLE_720P
-endif
 
 ifeq ($(TARGET_BOARD_PLATFORM),msm8610)
 libmm-venc-def += -D_MSM8610_
@@ -39,12 +34,8 @@ endif
 
 libmm-venc-def += -D_UBWC_
 
-ifeq ($(TARGET_DISABLED_UBWC),true)
-libmm-venc-def += -DDISABLE_UBWC
-endif
-
-ifeq ($(call is-board-platform-in-list, $(TARGETS_THAT_SUPPORT_VQZIP)),true)
-libmm-venc-def += -D_VQZIP_
+ifeq ($(TARGET_BOARD_PLATFORM),bengal)
+libmm-venc-def += -U_UBWC_
 endif
 
 ifeq ($(call is-board-platform-in-list, $(TARGETS_THAT_USE_FLAG_MSM8226)),true)
@@ -63,10 +54,6 @@ endif
 
 libmm-venc-def += -DUSE_CAMERA_METABUFFER_UTILS
 
-ifeq ($(ENABLE_HYP),true)
-libmm-venc-def += -DHYPERVISOR
-endif
-
 # Common Includes
 libmm-venc-inc      := $(LOCAL_PATH)/inc
 libmm-venc-inc      += $(LIBION_HEADER_PATHS)
@@ -76,15 +63,12 @@ libmm-venc-inc      += $(call project-path-for,qcom-media)/libstagefrighthw
 libmm-venc-inc      += $(call project-path-for,qcom-media)/libplatformconfig
 libmm-venc-inc      += $(TARGET_OUT_HEADERS)/adreno
 libmm-venc-inc      += $(call project-path-for,qcom-media)/libc2dcolorconvert
-libmm-venc-inc      += $(TARGET_OUT_HEADERS)/libvqzip
 libmm-venc-inc      += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
 libmm-venc-inc      += $(TOP)/frameworks/native/libs/nativewindow/include
 libmm-venc-inc      += $(TOP)/frameworks/native/libs/nativebase/include
+libmm-venc-inc      += $(TARGET_OUT_HEADERS)/fastcv
 libmm-venc-inc      += $(TOP)/frameworks/native/libs/arect/include
-
-ifeq ($(ENABLE_HYP),true)
-libmm-venc-inc      += $(call project-path-for,qcom-media)/hypv-intercept
-endif
+libmm-venc-inc      += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
 
 ifneq ($(call is-board-platform-in-list, $(TARGETS_THAT_DONT_SUPPORT_SW_VENC_ROTATION)),true)
 libmm-venc-inc      += hardware/libhardware/include/hardware
@@ -104,6 +88,14 @@ LOCAL_MODULE_TAGS               := optional
 LOCAL_VENDOR_MODULE             := true
 LOCAL_CFLAGS                    := $(libmm-venc-def)
 
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN), true)
+LOCAL_SANITIZE := integer_overflow
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN_DIAG), true)
+$(warning INTSAN_DIAG_ENABLED)
+LOCAL_SANITIZE_DIAG := integer_overflow
+endif
+endif
+
 LOCAL_HEADER_LIBRARIES := \
         media_plugin_headers \
         libnativebase_headers \
@@ -122,14 +114,13 @@ LOCAL_SHARED_LIBRARIES    := liblog libcutils libdl libplatformconfig libion
 LOCAL_SHARED_LIBRARIES    += libc2dcolorconvert
 # endif # ($(BOARD_USES_ADRENO), true)
 LOCAL_SHARED_LIBRARIES += libqdMetaData
-ifeq ($(ENABLE_HYP),true)
-LOCAL_SHARED_LIBRARIES += libhypv_intercept
-endif
+LOCAL_SHARED_LIBRARIES += libfastcvopt
 LOCAL_STATIC_LIBRARIES    := libOmxVidcCommon
 
 LOCAL_SRC_FILES   := src/omx_video_base.cpp
 LOCAL_SRC_FILES   += src/omx_video_encoder.cpp
 LOCAL_SRC_FILES   += src/video_encoder_device_v4l2.cpp
+LOCAL_SRC_FILES   += src/video_encoder_device_v4l2_params.cpp
 
 include $(BUILD_SHARED_LIBRARY)
 
@@ -149,6 +140,14 @@ LOCAL_MODULE_TAGS               := optional
 LOCAL_VENDOR_MODULE             := true
 LOCAL_CFLAGS                    := $(libmm-venc-def)
 
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN), true)
+LOCAL_SANITIZE := integer_overflow
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN_DIAG), true)
+$(warning INTSAN_DIAG_ENABLED)
+LOCAL_SANITIZE_DIAG := integer_overflow
+endif
+endif
+
 LOCAL_HEADER_LIBRARIES := \
         media_plugin_headers \
         libnativebase_headers \
@@ -163,6 +162,7 @@ LOCAL_PRELINK_MODULE      := false
 LOCAL_SHARED_LIBRARIES    := liblog libcutils libdl libplatformconfig libion
 LOCAL_SHARED_LIBRARIES    += libMpeg4SwEncoder
 LOCAL_SHARED_LIBRARIES    += libqdMetaData
+LOCAL_SHARED_LIBRARIES += libfastcvopt
 
 ifneq ($(call is-board-platform-in-list, $(TARGETS_THAT_DONT_SUPPORT_SW_VENC_ROTATION)),true)
 LOCAL_SHARED_LIBRARIES += libui

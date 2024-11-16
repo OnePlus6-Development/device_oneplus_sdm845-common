@@ -37,6 +37,11 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifdef _ANDROID_
 #include <gralloc_priv.h>
 #endif
+#ifdef _ANDROID_
+#include <cutils/properties.h>
+#else
+#define PROPERTY_VALUE_MAX 92
+#endif
 
 // BitMask Management logic
 #define BITS_PER_INDEX                          64
@@ -58,26 +63,23 @@ class profile_level_converter {
     static pl_map        profile_avc_omx_to_v4l2;
     static pl_map        profile_hevc_omx_to_v4l2;
     static pl_map        profile_mpeg2_omx_to_v4l2;
+    static pl_map        profile_vp8_omx_to_v4l2;
     static pl_map        profile_vp9_omx_to_v4l2;
-    static pl_map        profile_tme_omx_to_v4l2;
     static pl_map        level_avc_omx_to_v4l2;
     static pl_map        level_hevc_omx_to_v4l2;
     static pl_map        level_vp8_omx_to_v4l2;
     static pl_map        level_mpeg2_omx_to_v4l2;
     static pl_map        level_vp9_omx_to_v4l2;
-    static pl_map        level_tme_omx_to_v4l2;
     static pl_map        profile_avc_v4l2_to_omx;
     static pl_map        profile_hevc_v4l2_to_omx;
     static pl_map        profile_mpeg2_v4l2_to_omx;
     static pl_map        profile_vp9_v4l2_to_omx;
-    static pl_map        profile_tme_v4l2_to_omx;
     static pl_map        level_avc_v4l2_to_omx;
     static pl_map        level_hevc_v4l2_to_omx;
     static pl_map        level_vp8_v4l2_to_omx;
     static pl_map        level_mpeg2_v4l2_to_omx;
+    static pl_map        profile_vp8_v4l2_to_omx;
     static pl_map        level_vp9_v4l2_to_omx;
-    static pl_map        level_tme_v4l2_to_omx;
-
     static codec_map     profile_omx_to_v4l2_map;
     static codec_map     profile_v4l2_to_omx_map;
     static codec_map     level_omx_to_v4l2_map;
@@ -93,6 +95,7 @@ class profile_level_converter {
     static bool convert_v4l2_profile_to_omx(int codec, int v4l2_profile, int *omx_profile);
     static bool convert_omx_profile_to_v4l2(int codec, int omx_profile, int *v4l2_profile);
     static bool convert_v4l2_level_to_omx(int codec, int v4l2_level, int *omx_level);
+    static bool find_tier(int codec, int omx_level, unsigned int *tire);
     static bool convert_omx_level_to_v4l2(int codec, int omx_level, int *v4l2_level);
 };
 

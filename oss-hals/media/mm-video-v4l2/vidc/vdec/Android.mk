@@ -25,6 +25,7 @@ libmm-vdec-def += -D_ANDROID_ICS_
 libmm-vdec-def += -DPROCESS_EXTRADATA_IN_OUTPUT_PORT
 
 TARGETS_THAT_HAVE_VENUS_HEVC := apq8084 msm8994 msm8996
+# KONA_TODO_UPDATE: Disable SW codec for Kona for now
 TARGETS_THAT_DONT_NEED_SW_VDEC := msm8226 msm8916 msm8992 msm8996 sdm660 msm8998 msm8909
 
 ifeq ($(call is-board-platform-in-list, $(TARGETS_THAT_HAVE_VENUS_HEVC)),true)
@@ -36,6 +37,10 @@ libmm-vdec-def += -DSMOOTH_STREAMING_DISABLED
 endif
 
 libmm-vdec-def += -D_UBWC_
+
+ifeq ($(TARGET_BOARD_PLATFORM),bengal)
+libmm-vdec-def += -U_UBWC_
+endif
 
 ifeq ($(TARGET_USES_ION),true)
 libmm-vdec-def += -DUSE_ION
@@ -53,10 +58,6 @@ ifeq ($(call is-platform-sdk-version-at-least,27),true) # O-MR1
 libmm-vdec-def += -D_ANDROID_O_MR1_DIVX_CHANGES
 endif
 
-ifeq ($(call is-board-platform-in-list, sdm845),true)
-libmm-vdec-def += -DVENUS_USES_LEGACY_MISR_INFO
-endif
-
 include $(CLEAR_VARS)
 
 # Common Includes
@@ -70,7 +71,7 @@ libmm-vdec-inc      	+= $(call project-path-for,qcom-media)/libc2dcolorconvert
 libmm-vdec-inc      	+= $(TARGET_OUT_HEADERS)/mm-video/SwVdec
 libmm-vdec-inc      	+= $(TARGET_OUT_HEADERS)/mm-video/swvdec
 libmm-vdec-inc      	+= $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
-libmm-vdec-inc      	+= $(call project-path-for,qcom-media)/libarbitrarybytes/inc
+
 
 ifeq ($(PLATFORM_SDK_VERSION), 18)  #JB_MR2
 libmm-vdec-def += -DANDROID_JELLYBEAN_MR2=1
@@ -92,10 +93,6 @@ endif
 
 libmm-vdec-def += -DALLOCATE_OUTPUT_NATIVEHANDLE
 
-ifeq ($(ENABLE_HYP),true)
-libmm-vdec-def += -DHYPERVISOR
-libmm-vdec-inc += $(call project-path-for,qcom-media)/hypv-intercept
-endif
 # ---------------------------------------------------------------------------------
 # 			Make the Shared library (libOmxVdec)
 # ---------------------------------------------------------------------------------
@@ -106,6 +103,14 @@ LOCAL_MODULE                    := libOmxVdec
 LOCAL_MODULE_TAGS               := optional
 LOCAL_VENDOR_MODULE             := true
 LOCAL_CFLAGS                    := $(libmm-vdec-def) -Werror
+
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN), true)
+LOCAL_SANITIZE := integer_overflow
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN_DIAG), true)
+$(warning INTSAN_DIAG_ENABLED)
+LOCAL_SANITIZE_DIAG := integer_overflow
+endif
+endif
 
 LOCAL_HEADER_LIBRARIES := \
         media_plugin_headers \
@@ -122,14 +127,11 @@ LOCAL_SHARED_LIBRARIES  := liblog libcutils libdl libion
 LOCAL_SHARED_LIBRARIES  += libc2dcolorconvert
 LOCAL_SHARED_LIBRARIES  += libqdMetaData
 LOCAL_SHARED_LIBRARIES  += libplatformconfig
-LOCAL_SHARED_LIBRARIES  += libarbitrarybytes
-ifeq ($(ENABLE_HYP),true)
-LOCAL_SHARED_LIBRARIES  += libhypv_intercept
-endif
 
 LOCAL_SRC_FILES         := src/ts_parser.cpp
 LOCAL_STATIC_LIBRARIES  := libOmxVidcCommon
 LOCAL_SRC_FILES         += src/omx_vdec_v4l2.cpp
+LOCAL_SRC_FILES         += src/omx_vdec_v4l2_params.cpp
 
 include $(BUILD_SHARED_LIBRARY)
 
@@ -148,6 +150,14 @@ LOCAL_MODULE                  := libOmxSwVdec
 LOCAL_MODULE_TAGS             := optional
 LOCAL_VENDOR_MODULE           := true
 LOCAL_CFLAGS                  := $(libmm-vdec-def)
+
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN), true)
+LOCAL_SANITIZE := integer_overflow
+ifeq ($(TARGET_ENABLE_VIDC_INTSAN_DIAG), true)
+$(warning INTSAN_DIAG_ENABLED)
+LOCAL_SANITIZE_DIAG := integer_overflow
+endif
+endif
 
 LOCAL_HEADER_LIBRARIES := \
         media_plugin_headers \

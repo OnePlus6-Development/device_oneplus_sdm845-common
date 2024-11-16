@@ -39,6 +39,7 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "qc_omx_common.h"        // OMX API
 #include <string.h>
 
+
 #define OMX_REGISTRY_ENTRY(name, lib_name, role) \
   { \
     name, \

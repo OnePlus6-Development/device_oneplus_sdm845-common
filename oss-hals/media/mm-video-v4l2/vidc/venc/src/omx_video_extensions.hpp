@@ -102,12 +102,6 @@ void omx_video::init_vendor_extensions(VendorExtensionStore &store) {
     ADD_EXTENSION("qti-ext-enc-caps-preprocess", OMX_QTIIndexParamCapabilitiesRotationSupport, OMX_DirOutput)
     ADD_PARAM_END("rotation", OMX_AndroidVendorValueInt32)
 
-    ADD_EXTENSION("qti-ext-enc-blur-support", OMX_QTIIndexParamCapabilitiesBlurSupport, OMX_DirInput)
-    ADD_PARAM_END ("blur-support", OMX_AndroidVendorValueInt32)
-
-    ADD_EXTENSION("qti-ext-enc-color-conversion-support", OMX_QTIIndexParamCapabilitiesColorSpaceConversionSupport, OMX_DirInput)
-    ADD_PARAM_END ("color-conversion-support", OMX_AndroidVendorValueInt32)
-
     ADD_EXTENSION("qti-ext-enc-caps-ltr", OMX_QTIIndexParamCapabilitiesMaxLTR, OMX_DirOutput)
     ADD_PARAM_END("max-count", OMX_AndroidVendorValueInt32)
 
@@ -126,10 +120,8 @@ void omx_video::init_vendor_extensions(VendorExtensionStore &store) {
     ADD_PARAM    ("qp-b", OMX_AndroidVendorValueInt32)
     ADD_PARAM_END("qp-b-enable", OMX_AndroidVendorValueInt32)
 
-    ADD_EXTENSION("qti-ext-enc-blurinfo", OMX_QTIIndexParamVideoEnableBlur, OMX_DirInput)
+    ADD_EXTENSION("qti-ext-enc-blurinfo", OMX_QTIIndexConfigVideoBlurResolution, OMX_DirInput)
     ADD_PARAM_END("info", OMX_AndroidVendorValueInt32)
-    ADD_EXTENSION("qti-ext-enc-blurfilter", OMX_QTIIndexConfigVideoBlurResolution, OMX_DirInput)
-    ADD_PARAM_END("strength", OMX_AndroidVendorValueInt32)
 
     ADD_EXTENSION("qti-ext-enc-qp-range", OMX_QcomIndexParamVideoIPBQPRange, OMX_DirOutput)
     ADD_PARAM    ("qp-i-min", OMX_AndroidVendorValueInt32)
@@ -145,6 +137,8 @@ void omx_video::init_vendor_extensions(VendorExtensionStore &store) {
     ADD_EXTENSION("qti-ext-enc-linear-color-format", OMX_QTIIndexParamEnableLinearColorFormat, OMX_DirInput)
     ADD_PARAM_END("value", OMX_AndroidVendorValueInt32)
 
+    ADD_EXTENSION("qti-ext-enc-vbvdelay", OMX_QTIIndexParamVbvDelay, OMX_DirInput)
+    ADD_PARAM_END("value", OMX_AndroidVendorValueInt32)
     ADD_EXTENSION("qti-ext-enc-roiinfo", OMX_QTIIndexConfigVideoRoiRectRegionInfo, OMX_DirInput)
     ADD_PARAM    ("timestamp", OMX_AndroidVendorValueInt64)
     ADD_PARAM    ("type", OMX_AndroidVendorValueString)
@@ -153,6 +147,9 @@ void omx_video::init_vendor_extensions(VendorExtensionStore &store) {
 
     ADD_EXTENSION("qti-ext-enc-roiinfo-rect-mode", OMX_QTIIndexConfigVideoRoiRectRegionInfo, OMX_DirOutput)
     ADD_PARAM_END("enable", OMX_AndroidVendorValueInt32)
+
+    ADD_EXTENSION("qti-ext-enc-content-adaptive-mode", OMX_QTIIndexConfigContentAdaptiveCoding, OMX_DirInput)
+    ADD_PARAM_END("value", OMX_AndroidVendorValueInt32)
 }
 
 OMX_ERRORTYPE omx_video::get_vendor_extension_config(
@@ -275,35 +272,14 @@ OMX_ERRORTYPE omx_video::get_vendor_extension_config(
         {
             char exType[OMX_MAX_STRINGVALUE_SIZE+1];
             memset (exType,0, (sizeof(char)*OMX_MAX_STRINGVALUE_SIZE));
-            if ((OMX_BOOL)(m_sExtraData & VENC_EXTRADATA_LTRINFO)){
-                const char *extraDataVideoLTRInfo = getStringForExtradataType(OMX_ExtraDataVideoLTRInfo);
-                if(extraDataVideoLTRInfo != NULL &&
-                        (strlcat(exType, extraDataVideoLTRInfo,
-                                   OMX_MAX_STRINGVALUE_SIZE)) >= OMX_MAX_STRINGVALUE_SIZE) {
-                    DEBUG_PRINT_LOW("extradata string size exceeds size %d",OMX_MAX_STRINGVALUE_SIZE );
-                }
+            if ((OMX_BOOL)(m_sExtraData & EXTRADATA_ADVANCED)) {
+                strlcat(exType, "advanced", OMX_MAX_STRINGVALUE_SIZE);
             }
-            if ((OMX_BOOL)(m_sExtraData & VENC_EXTRADATA_MBINFO)) {
+            if ((OMX_BOOL)(m_sExtraData & EXTRADATA_ENC_INPUT_ROI)) {
                 if (exType[0]!=0) {
                     strlcat(exType,"|", OMX_MAX_STRINGVALUE_SIZE);
                 }
-                const char *extraDataVideoEncoderMBInfo = getStringForExtradataType(OMX_ExtraDataVideoEncoderMBInfo);
-                if(extraDataVideoEncoderMBInfo != NULL &&
-                        (strlcat(exType, extraDataVideoEncoderMBInfo,
-                                 OMX_MAX_STRINGVALUE_SIZE)) >= OMX_MAX_STRINGVALUE_SIZE) {
-                    DEBUG_PRINT_LOW("extradata string size exceeds size %d",OMX_MAX_STRINGVALUE_SIZE );
-                }
-            }
-            if ((OMX_BOOL)(m_sExtraData & VENC_EXTRADATA_ROI)) {
-                if (exType[0]!=0) {
-                    strlcat(exType,"|", OMX_MAX_STRINGVALUE_SIZE);
-                }
-                const char *extraDataVideoEncoderROIInfo = getStringForExtradataType(OMX_ExtraDataInputROIInfo);
-                if(extraDataVideoEncoderROIInfo != NULL &&
-                        (strlcat(exType, extraDataVideoEncoderROIInfo,
-                                 OMX_MAX_STRINGVALUE_SIZE)) >= OMX_MAX_STRINGVALUE_SIZE) {
-                    DEBUG_PRINT_LOW("extradata string size exceeds size %d",OMX_MAX_STRINGVALUE_SIZE );
-                }
+                strlcat(exType, "roiinfo", OMX_MAX_STRINGVALUE_SIZE);
             }
             setStatus &= vExt.setParamString(ext, "types", exType);
             DEBUG_PRINT_LOW("VendorExt: getparam: Extradata %s",exType);
@@ -326,41 +302,7 @@ OMX_ERRORTYPE omx_video::get_vendor_extension_config(
         }
         case OMX_QTIIndexParamCapabilitiesRotationSupport:
         {
-            struct v4l2_queryctrl query_ctrl;
-            memset(&query_ctrl, 0, sizeof(struct v4l2_queryctrl));
-            query_ctrl.id = V4L2_CID_MPEG_VIDC_VIDEO_ROTATION_CAPS;
-            if (dev_query_cap(query_ctrl) && (query_ctrl.maximum > 0)) {
-                setStatus &= vExt.setParamInt32(ext, "rotation",OMX_TRUE);
-            }
-            else {
-                setStatus &= vExt.setParamInt32(ext, "rotation",OMX_FALSE);
-            }
-            break;
-        }
-        case OMX_QTIIndexParamCapabilitiesBlurSupport:
-        {
-            struct v4l2_queryctrl query_ctrl;
-            memset(&query_ctrl, 0, sizeof(struct v4l2_queryctrl));
-            query_ctrl.id = V4L2_CID_MPEG_VIDC_VIDEO_BLUR_WIDTH;
-            if (dev_query_cap(query_ctrl) && (query_ctrl.maximum > 0)) {
-                setStatus &= vExt.setParamInt32(ext, "blur-support",OMX_TRUE);
-            }
-            else {
-                setStatus &= vExt.setParamInt32(ext, "blur-support",OMX_FALSE);
-            }
-            break;
-        }
-        case OMX_QTIIndexParamCapabilitiesColorSpaceConversionSupport:
-        {
-            struct v4l2_queryctrl query_ctrl;
-            memset(&query_ctrl, 0, sizeof(struct v4l2_queryctrl));
-            query_ctrl.id = V4L2_CID_MPEG_VIDC_VIDEO_COLOR_SPACE_CAPS;
-            if (dev_query_cap(query_ctrl) && (query_ctrl.maximum > 0)) {
-                setStatus &= vExt.setParamInt32(ext, "color-conversion-support",OMX_TRUE);
-            }
-            else {
-                setStatus &= vExt.setParamInt32(ext, "color-conversion-support",OMX_FALSE);
-            }
+            setStatus &= vExt.setParamInt32(ext, "rotation",1);
             break;
         }
         case OMX_QTIIndexParamCapabilitiesMaxTemporalLayers:
@@ -393,6 +335,7 @@ OMX_ERRORTYPE omx_video::get_vendor_extension_config(
         }
         case OMX_QTIIndexParamVideoEnableBlur:
         case OMX_QTIIndexConfigVideoBlurResolution:
+        case OMX_QTIIndexConfigContentAdaptiveCoding:
         {
             break;
         }
@@ -414,6 +357,11 @@ OMX_ERRORTYPE omx_video::get_vendor_extension_config(
         case OMX_QTIIndexParamEnableLinearColorFormat:
         {
             setStatus &= vExt.setParamInt32(ext, "value", m_sParamLinearColorFormat.bEnable);
+            break;
+        }
+        case OMX_QTIIndexParamVbvDelay:
+        {
+            setStatus &= vExt.setParamInt32(ext, "value", m_sParamVbvDelay.nVbvDelay);
             break;
         }
         case OMX_QTIIndexConfigVideoRoiRectRegionInfo:
@@ -802,19 +750,18 @@ OMX_ERRORTYPE omx_video::set_vendor_extension_config(
                 break;
             }
             char *rest = exType;
-            char *token = strtok_r(exType, "|", &rest);
-            do {
+            char *token = NULL;
+            while ((token = strtok_r(rest, "|", &rest))) {
                 extraDataParam.bEnabled = OMX_TRUE;
-                extraDataParam.nIndex = (OMX_INDEXTYPE)getIndexForExtradataType(token);
-                if (extraDataParam.nIndex < 0) {
-                    DEBUG_PRINT_HIGH(" extradata %s not supported ",token);
-                    continue;
-                }
-                if (extraDataParam.nIndex == (OMX_INDEXTYPE)OMX_ExtraDataVideoLTRInfo ||
-                    extraDataParam.nIndex == (OMX_INDEXTYPE)OMX_ExtraDataVideoEncoderMBInfo) {
+                if (!strcmp(token, "advanced")) {
+                    extraDataParam.nIndex = (OMX_INDEXTYPE)OMX_QTI_ExtraDataCategory_Advanced;
                     extraDataParam.nPortIndex = (OMX_U32)PORT_INDEX_OUT;
-                } else if (extraDataParam.nIndex == (OMX_INDEXTYPE)OMX_ExtraDataInputROIInfo) {
+                } else if (!strcmp(token, "roiinfo")) {
+                    extraDataParam.nIndex = (OMX_INDEXTYPE)OMX_QTI_ExtraDataCategory_Enc_ROI;
                     extraDataParam.nPortIndex = (OMX_U32)PORT_INDEX_IN;
+                } else {
+                    DEBUG_PRINT_HIGH("extradata %s not supported ", token);
+                    continue;
                 }
                 DEBUG_PRINT_HIGH("VENDOR-EXT: set_config: extradata: enable for index = %d",
                                   extraDataParam.nIndex);
@@ -823,7 +770,7 @@ OMX_ERRORTYPE omx_video::set_vendor_extension_config(
                 if (err != OMX_ErrorNone) {
                     DEBUG_PRINT_ERROR("set_config: OMX_QcomIndexParamIndexExtraDataType failed !");
                 }
-            } while ((token = strtok_r(NULL, "|", &rest)));
+            }
             break;
         }
         case OMX_QTIIndexParamColorSpaceConversion:
@@ -850,8 +797,6 @@ OMX_ERRORTYPE omx_video::set_vendor_extension_config(
         case OMX_QTIIndexParamCapabilitiesMaxDownScaleRatio:
         case OMX_QTIIndexParamCapabilitiesRotationSupport:
         case OMX_QTIIndexParamCapabilitiesMaxTemporalLayers:
-        case OMX_QTIIndexParamCapabilitiesBlurSupport:
-        case OMX_QTIIndexParamCapabilitiesColorSpaceConversionSupport:
         {
             break;
         }
@@ -888,34 +833,13 @@ OMX_ERRORTYPE omx_video::set_vendor_extension_config(
             }
             break;
         }
-        case OMX_QTIIndexParamVideoEnableBlur:
-        {
-            OMX_QTI_VIDEO_CONFIG_BLURINFO blurInfo;
-
-            memcpy(&blurInfo, &m_blurInfo, sizeof(OMX_QTI_VIDEO_CONFIG_BLURINFO));
-
-            valueSet |= vExt.readParamInt32(ext, "info", (OMX_S32 *)&(blurInfo.nBlurInfo));
-            if (!valueSet) {
-                break;
-            }
-
-            DEBUG_PRINT_HIGH("VENDOR-EXT: set_param: OMX_QTIIndexParamVideoEnableBlur : %u",
-                             blurInfo.nBlurInfo);
-
-            err = set_parameter(
-                    NULL, (OMX_INDEXTYPE)OMX_QTIIndexParamVideoEnableBlur, &blurInfo);
-            if (err != OMX_ErrorNone) {
-                DEBUG_PRINT_ERROR("set_param: OMX_QTIIndexParamVideoEnableBlur failed !");
-            }
-            break;
-        }
         case OMX_QTIIndexConfigVideoBlurResolution:
         {
             OMX_QTI_VIDEO_CONFIG_BLURINFO blurInfo;
 
             memcpy(&blurInfo, &m_blurInfo, sizeof(OMX_QTI_VIDEO_CONFIG_BLURINFO));
 
-            valueSet |= vExt.readParamInt32(ext, "strength", (OMX_S32 *)&(blurInfo.nBlurInfo));
+            valueSet |= vExt.readParamInt32(ext, "info", (OMX_S32 *)&(blurInfo.nBlurInfo));
             if (!valueSet) {
                 break;
             }
@@ -989,6 +913,25 @@ OMX_ERRORTYPE omx_video::set_vendor_extension_config(
                    NULL, (OMX_INDEXTYPE)OMX_QTIIndexParamEnableLinearColorFormat, &linearColor);
             if (err != OMX_ErrorNone) {
                 DEBUG_PRINT_ERROR("set_param: OMX_QTIIndexParamEnableLinearColorFormat failed !");
+            }
+            break;
+        }
+        case OMX_QTIIndexParamVbvDelay:
+        {
+            OMX_EXTNINDEX_VIDEO_VBV_DELAY vbvDelay;
+            memcpy(&vbvDelay, &m_sParamVbvDelay, sizeof(OMX_EXTNINDEX_VIDEO_VBV_DELAY));
+            valueSet |= vExt.readParamInt32(ext, "value", (OMX_S32 *)&(vbvDelay.nVbvDelay));
+            if (!valueSet) {
+                break;
+            }
+
+            DEBUG_PRINT_HIGH("VENDOR-EXT: set_param: OMX_QTIIndexParamVbvDelay : %d",
+                                vbvDelay.nVbvDelay);
+
+            err = set_parameter(
+                   NULL, (OMX_INDEXTYPE)OMX_QTIIndexParamVbvDelay, &vbvDelay);
+            if (err != OMX_ErrorNone) {
+                DEBUG_PRINT_ERROR("set_param: OMX_QTIIndexParamVbvDelay failed !");
             }
             break;
         }
@@ -1091,6 +1034,23 @@ OMX_ERRORTYPE omx_video::set_vendor_extension_config(
                 }
             } else {
                 DEBUG_PRINT_LOW("ROI-Ext: none valid roi region info");
+            }
+            break;
+        }
+        case OMX_QTIIndexConfigContentAdaptiveCoding:
+        {
+            OMX_U32 bitrateSavingsMode;
+            valueSet |= vExt.readParamInt32(ext, "value", (OMX_S32 *)&(bitrateSavingsMode));
+            if (!valueSet) {
+                break;
+            }
+            DEBUG_PRINT_HIGH("VENDOR-EXT: set_config: OMX_QTIIndexConfigContentAdaptiveCoding : %u",
+                             bitrateSavingsMode);
+
+            err = set_config(
+                    NULL, (OMX_INDEXTYPE)OMX_QTIIndexConfigContentAdaptiveCoding, &bitrateSavingsMode);
+            if (err != OMX_ErrorNone) {
+                DEBUG_PRINT_ERROR("set_config: OMX_QTIIndexConfigContentAdaptiveCoding failed !");
             }
             break;
         }

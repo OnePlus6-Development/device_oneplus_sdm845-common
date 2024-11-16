@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2009, 2015, 2018-2019, The Linux Foundation. All rights reserved.
+Copyright (c) 2009, 2015, 2018-2019, 2021,The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -50,7 +50,9 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "omx_core_cmp.h"
 #include <cutils/properties.h>
 
+#ifndef VIDC_STUB_HAL
 #include "ConfigStore.h"
+#endif
 
 extern omx_core_cb_type core[];
 extern const unsigned int SIZE_OF_CORE;
@@ -129,37 +131,22 @@ OMX_Init()
     property_get("ro.board.platform", platform_name, "0");
 
   DEBUG_PRINT("OMXCORE API - OMX_Init \n");
-
   // Use below method to generate list of components actually supported
   // on any given platform. Core list is considered as superset and does
   // not determine the actual supported codecs on a particular target.
   num_components = 0;
   for (int i = 0; i < SIZE_OF_CORE; i++) {
-      if (!strcmp(platform_name, "sm6150")) {
-          if (!strcmp("OMX.qti.video.decoder.vc1sw", core[i].name) || !strcmp("OMX.qcom.video.encoder.heic", core[i].name)) {
-                //Talos (6150) both does not support vc1 and heic hence don't add them in list
-              if (property_get("vendor.media.target.version", version, "0") && (atoi(version) == 0))
+      if (!strncmp(platform_name, "lito", 4)) {
+          if (!strcmp("OMX.qcom.video.decoder.vp8", core[i].name) || !strcmp("OMX.qcom.video.encoder.vp8", core[i].name)) {
+                //Bitra (SM6350) both does not support VP8 encoder and decoder hence don't add them in list
+              if (property_get("vendor.media.target.version", version, "0") && ((atoi(version) == 2) || (atoi(version) == 3)))
                   continue;
-          } else if (!strcmp("OMX.qcom.video.encoder.tme", core[i].name) || !strcmp("OMX.qcom.video.encoder.tme.secure", core[i].name))
-                    continue;
-      } else if (!strcmp(platform_name, "atoll")) {
-                //Atoll does not support vc1 and vpp hence don't add them in list
-              if (!strcmp("OMX.qti.video.decoder.vc1sw", core[i].name) || !strcmp("OMX.qti.vdec.vpp", core[i].name))
-                     continue;
-      } else if (!strcmp(platform_name, "trinket")) {
-                //Trinket does not support vc1,tme,tme-secure hence don't add them in list
-              if (!strcmp("OMX.qti.video.decoder.vc1sw", core[i].name) || !strcmp("OMX.qcom.video.encoder.tme", core[i].name) ||
-                  !strcmp("OMX.qcom.video.encoder.tme.secure", core[i].name) || !strcmp("OMX.qti.vdec.vpp", core[i].name))
-                     continue;
-      } else if (!strcmp(platform_name, "msmnile")) {
-                //Hana does not support tme,tme secure hence donot add to list
-                if (!strcmp("OMX.qcom.video.encoder.tme", core[i].name) || !strcmp("OMX.qcom.video.encoder.tme.secure", core[i].name))
-                    continue;
+          }
       }
 
     memcpy(&component[num_components++],
            &core[i], sizeof(omx_core_cb_type));
-  }
+    }
   return OMX_ErrorNone;
 }
 
@@ -474,9 +461,14 @@ OMX_GetHandle(OMX_OUT OMX_HANDLETYPE*     handle,
       if (!strncmp(component[cmp_index].so_lib_name, hwDecLib, strlen(hwDecLib)) ||
           !strncmp(component[cmp_index].so_lib_name, swDecLib, strlen(swDecLib))) {
         bool isVppEnabled = false;
-        if (isConfigStoreEnabled()) {
+        bool isCSEnabled = false;
+#ifndef VIDC_STUB_HAL
+        isCSEnabled = isConfigStoreEnabled();
+        if (isCSEnabled) {
           getConfigStoreBool("vpp", "enable", &isVppEnabled, false);
-        } else {
+        }
+#endif
+        if (!isCSEnabled) {
           char value[PROPERTY_VALUE_MAX];
           if ((property_get("vendor.media.vpp.enable", value, NULL))
                && (!strcmp("1", value) || !strcmp("true", value))) {
@@ -722,6 +714,9 @@ OMX_ComponentNameEnum(OMX_OUT OMX_STRING componentName,
                       OMX_IN  OMX_U32            index)
 {
   OMX_ERRORTYPE eRet = OMX_ErrorNone;
+  DEBUG_PRINT("OMXCORE API - OMX_ComponentNameEnum %p %d %d\n", componentName
+                                                              ,(unsigned)nameLen
+                                                              ,(unsigned)index);
   if (index < num_components &&
       strncmp(component[index].name, "OMX.QCOM.CUST.COMP.START",
               strlen("OMX.QCOM.CUST.COMP.START")))
@@ -729,10 +724,8 @@ OMX_ComponentNameEnum(OMX_OUT OMX_STRING componentName,
     #ifdef _ANDROID_
     strlcpy(componentName, component[index].name, nameLen);
     #else
-    strlcpy(componentName, component[index].name, nameLen);
+    strlcpy(componentName, component[index].name,nameLen);
     #endif
-    DEBUG_PRINT("OMXCORE API - OMX_ComponentNameEnum [%d] %s\n",
-                (unsigned)index, componentName);
   }
   else
   {
@@ -889,16 +882,14 @@ OMX_GetRolesOfComponent(OMX_IN OMX_STRING compName,
     {
       if (!strcmp(compName, component[i].name))
       {
-        for (j = 0; j < OMX_CORE_MAX_CMP_ROLES && component[i].roles[j]; j++)
+        for(j=0; (j<OMX_CORE_MAX_CMP_ROLES) && component[i].roles[j];j++)
         {
           if(roles && roles[*numRoles])
           {
             #ifdef _ANDROID_
-            strlcpy((char *)roles[*numRoles],
-                    component[i].roles[j], OMX_MAX_STRINGNAME_SIZE);
+            strlcpy((char *)roles[*numRoles],component[i].roles[j],OMX_MAX_STRINGNAME_SIZE);
             #else
-            strlcpy((char *)roles[*numRoles],
-                    component[i].roles[j], OMX_MAX_STRINGNAME_SIZE);
+            strlcpy((char *)roles[*numRoles],component[i].roles[j],OMX_MAX_STRINGNAME_SIZE);
             #endif
           }
           (*numRoles)++;

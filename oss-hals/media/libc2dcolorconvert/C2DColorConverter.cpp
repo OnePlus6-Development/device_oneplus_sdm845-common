@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 - 2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012 - 2020, The Linux Foundation. All rights reserved.
  *
  * redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -29,6 +29,13 @@
 
 #include <C2DColorConverter.h>
 
+void swap(size_t &x, size_t &y)
+{
+    x = x ^ y;
+    y = x ^ y;
+    x = x ^ y;
+}
+
 C2DColorConverter::C2DColorConverter()
     : mC2DLibHandle(NULL),
       mAdrenoUtilsHandle(NULL)
@@ -43,6 +50,7 @@ C2DColorConverter::C2DColorConverter()
     mSrcStride = 0;
     mDstWidth = 0;
     mDstHeight = 0;
+    mRotation = C2D_TARGET_ROTATE_0;
     mSrcFormat = NO_COLOR_FORMAT;
     mDstFormat = NO_COLOR_FORMAT;
     mSrcSurfaceDef = NULL;
@@ -166,31 +174,29 @@ bool C2DColorConverter::setResolution(size_t srcWidth, size_t srcHeight,
     int32_t retval = -1;
     if (enabled) {
         pthread_mutex_lock(&mLock);
+
+        ClearSurfaces();
+
         mSrcWidth = srcWidth;
         mSrcHeight = srcHeight;
         mSrcStride = srcStride;
         mDstWidth = dstWidth;
         mDstHeight = dstHeight;
-        if (srcFormat == RGBA8888 &&
-#ifdef __LIBGBM__
-            flags & GBM_BO_USAGE_UBWC_ALIGNED_QTI) {
-#else
-            flags & private_handle_t::PRIV_FLAGS_UBWC_ALIGNED) {
-#endif
-            mSrcFormat = RGBA8888_UBWC;
-        } else {
-            mSrcFormat = srcFormat;
-        }
+        mSrcFormat = srcFormat;
         mDstFormat = dstFormat;
-        mSrcSize = calcSize(mSrcFormat, srcWidth, srcHeight);
-        mDstSize = calcSize(dstFormat, dstWidth, dstHeight);
-        mSrcYSize = calcYSize(mSrcFormat, srcWidth, srcHeight);
-        mDstYSize = calcYSize(dstFormat, dstWidth, dstHeight);
 
-        mFlags = flags; // can be used for rotation
+        if (mRotation == C2D_TARGET_ROTATE_90 ||
+            mRotation == C2D_TARGET_ROTATE_270) {
+                swap(mDstWidth, mDstHeight);
+        }
+        mSrcSize = calcSize(srcFormat, mSrcWidth, mSrcHeight);
+        mDstSize = calcSize(dstFormat, mDstWidth, mDstHeight);
+        mSrcYSize = calcYSize(srcFormat, mSrcWidth, mSrcHeight);
+        mDstYSize = calcYSize(dstFormat, mDstWidth, mDstHeight);
+        mFlags = flags;
 
-        retval = getDummySurfaceDef(mSrcFormat, srcWidth, srcHeight, true);
-        retval |= getDummySurfaceDef(dstFormat, dstWidth, dstHeight, false);
+        retval = getDummySurfaceDef(srcFormat, mSrcWidth, mSrcHeight, true);
+        retval |= getDummySurfaceDef(dstFormat, mDstWidth, mDstHeight, false);
 
         if (retval == 0) {
             memset((void*)&mBlit,0,sizeof(C2D_OBJECT));
@@ -215,7 +221,24 @@ bool C2DColorConverter::setResolution(size_t srcWidth, size_t srcHeight,
     return retval == 0? true:false;
 }
 
-
+void C2DColorConverter::setRotation(int32_t rotation) {
+    // C2D does rotation in anticlock wise, where as VPE rotates in clockwise
+    // Hence swapping the 90 and 270 angles to rotate in clockwise
+    switch (rotation) {
+        case 90:
+            mRotation  = C2D_TARGET_ROTATE_270;
+            break;
+        case 180:
+            mRotation  = C2D_TARGET_ROTATE_180;
+            break;
+        case 270:
+            mRotation  = C2D_TARGET_ROTATE_90;
+            break;
+        default:
+            mRotation = C2D_TARGET_ROTATE_0;
+            break;
+    }
+}
 bool C2DColorConverter::convertC2D(int srcFd, void *srcBase, void * srcData,
                                    int dstFd, void *dstBase, void * dstData)
 {
@@ -264,7 +287,7 @@ bool C2DColorConverter::convertC2D(int srcFd, void *srcBase, void * srcData,
         if (ret == C2D_STATUS_OK) {
 
           mBlit.surface_id = mSrcSurface;
-          ret = mC2DDraw(mDstSurface, C2D_TARGET_ROTATE_0, 0, 0, 0, &mBlit, 1);
+          ret = mC2DDraw(mDstSurface, mRotation, 0, 0, 0, &mBlit, 1);
           mC2DFinish(mDstSurface);
 
           if (ret == C2D_STATUS_OK) {
@@ -316,11 +339,43 @@ bool C2DColorConverter::isYUVSurface(ColorConvertFormat format)
         case NV12_128m:
         case NV12_UBWC:
         case TP10_UBWC:
-        case CbYCrY:
+        case P010:
+        case VENUS_P010:
             return true;
         default:
             return false;
     }
+}
+
+void C2DColorConverter::ClearSurfaces()
+{
+        if (mSrcSurface) {
+            mC2DDestroySurface(mSrcSurface);
+            mSrcSurface = 0;
+        }
+
+         if (mSrcSurfaceDef) {
+            if (isYUVSurface(mSrcFormat)) {
+                delete ((C2D_YUV_SURFACE_DEF *)mSrcSurfaceDef);
+            } else {
+                delete ((C2D_RGB_SURFACE_DEF *)mSrcSurfaceDef);
+            }
+            mSrcSurfaceDef = NULL;
+        }
+
+        if (mDstSurface) {
+            mC2DDestroySurface(mDstSurface);
+            mDstSurface = 0;
+        }
+
+        if (mDstSurfaceDef) {
+            if (isYUVSurface(mDstFormat)) {
+                delete ((C2D_YUV_SURFACE_DEF *)mDstSurfaceDef);
+            } else {
+                delete ((C2D_RGB_SURFACE_DEF *)mDstSurfaceDef);
+            }
+            mDstSurfaceDef = NULL;
+        }
 }
 
 int32_t C2DColorConverter::getDummySurfaceDef(ColorConvertFormat format,
@@ -330,16 +385,6 @@ int32_t C2DColorConverter::getDummySurfaceDef(ColorConvertFormat format,
     void *surfaceDef = NULL;
     C2D_SURFACE_TYPE hostSurfaceType;
     C2D_STATUS ret;
-
-    if (isSource){
-        if (mSrcSurface) {
-            mC2DDestroySurface(mSrcSurface);
-            mSrcSurface = 0;
-        }
-    } else if (mDstSurface) {
-        mC2DDestroySurface(mDstSurface);
-        mDstSurface = 0;
-    }
 
     if (isYUVSurface(format)) {
         C2D_YUV_SURFACE_DEF **surfaceYUVDef = (C2D_YUV_SURFACE_DEF **)
@@ -507,8 +552,9 @@ uint32_t C2DColorConverter::getC2DFormat(ColorConvertFormat format, bool isSourc
             return C2D_COLOR_FORMAT_420_NV12 | C2D_FORMAT_UBWC_COMPRESSED;
         case TP10_UBWC:
             return C2D_COLOR_FORMAT_420_TP10 | C2D_FORMAT_UBWC_COMPRESSED;
-        case CbYCrY:
-            return C2D_COLOR_FORMAT_422_UYVY;
+        case P010:
+        case VENUS_P010:
+            return C2D_COLOR_FORMAT_420_P010;
         default:
             ALOGW("%s: Format not supported , %d", __FUNCTION__, format);
             return -1;
@@ -533,8 +579,10 @@ size_t C2DColorConverter::calcStride(ColorConvertFormat format, size_t width)
             return ALIGN(width, ALIGN16);
         case NV12_512:
             return ALIGN(width, ALIGN512);
-        case NV12_128m:
-            return ALIGN(width, ALIGN128);
+        case NV12_128m: {
+            int32_t stride_alignment = VENUS_Y_STRIDE(COLOR_FMT_NV12, 1);
+            return ALIGN(width, stride_alignment);
+        }
         case YCbCr420P:
             return ALIGN(width, ALIGN16);
         case YCrCb420P:
@@ -543,10 +591,10 @@ size_t C2DColorConverter::calcStride(ColorConvertFormat format, size_t width)
             return VENUS_Y_STRIDE(COLOR_FMT_NV12_UBWC, width);
         case TP10_UBWC:
             return VENUS_Y_STRIDE(COLOR_FMT_NV12_BPP10_UBWC, width);
-        case CbYCrY:
+        case P010:
             return ALIGN(width*2, ALIGN64);
-        case RGBA8888_UBWC:
-            return VENUS_RGB_STRIDE(COLOR_FMT_RGBA8888_UBWC, width);
+        case VENUS_P010:
+            return ALIGN(width*2, ALIGN256);
         default:
             ALOGW("%s: Format not supported , %d", __FUNCTION__, format);
             return 0;
@@ -571,8 +619,11 @@ size_t C2DColorConverter::calcYSize(ColorConvertFormat format, size_t width, siz
         }
         case NV12_512:
             return ALIGN(width, ALIGN512) * ALIGN(height, ALIGN512);
-        case NV12_128m:
-            return ALIGN(width, ALIGN128) * ALIGN(height, ALIGN32);
+        case NV12_128m: {
+            int32_t stride_alignment = VENUS_Y_STRIDE(COLOR_FMT_NV12, 1);
+            int32_t scanline_alignment = VENUS_Y_SCANLINES(COLOR_FMT_NV12, 1);
+            return ALIGN(width, stride_alignment) * ALIGN(height, scanline_alignment);
+        }
         case NV12_UBWC:
             return ALIGN( VENUS_Y_STRIDE(COLOR_FMT_NV12_UBWC, width) *
                     VENUS_Y_SCANLINES(COLOR_FMT_NV12_UBWC, height), ALIGN4K) +
@@ -583,6 +634,10 @@ size_t C2DColorConverter::calcYSize(ColorConvertFormat format, size_t width, siz
                           VENUS_Y_SCANLINES(COLOR_FMT_NV12_BPP10_UBWC, height), ALIGN4K) +
                 ALIGN( VENUS_Y_META_STRIDE(COLOR_FMT_NV12_BPP10_UBWC, width) *
                        VENUS_Y_META_SCANLINES(COLOR_FMT_NV12_BPP10_UBWC, height), ALIGN4K);
+        case P010:
+            return (ALIGN(width*2, ALIGN64) * height);
+        case VENUS_P010:
+            return (ALIGN(width*2, ALIGN256) * ALIGN(height, ALIGN32));
         default:
             ALOGW("%s: Format not supported , %d", __FUNCTION__, format);
             return 0;
@@ -627,20 +682,20 @@ size_t C2DColorConverter::calcSize(ColorConvertFormat format, size_t width, size
             break;
         case YCbCr420SP:
             alignedw = ALIGN(width, ALIGN16);
-            size = ALIGN((alignedw * height) + (ALIGN(width/2, ALIGN32) * (height/2) * 2), ALIGN4K);
+            size = ALIGN((alignedw * height) + (ALIGN((width+1)/2, ALIGN32) * ((height+1)/2) * 2), ALIGN4K);
             break;
         case YCbCr420P:
             alignedw = ALIGN(width, ALIGN16);
-            size = ALIGN((alignedw * height) + (ALIGN(width/2, ALIGN16) * (height/2) * 2), ALIGN4K);
+            size = ALIGN((alignedw * height) + (ALIGN((width+1)/2, ALIGN16) * ((height+1)/2) * 2), ALIGN4K);
             break;
         case YCrCb420P:
             alignedw = ALIGN(width, ALIGN16);
-            size = ALIGN((alignedw * height) + (ALIGN(width/2, ALIGN16) * (height/2) * 2), ALIGN4K);
+            size = ALIGN((alignedw * height) + (ALIGN((width+1)/2, ALIGN16) * ((height+1)/2) * 2), ALIGN4K);
             break;
         case YCbCr420Tile:
             alignedw = ALIGN(width, ALIGN128);
             alignedh = ALIGN(height, ALIGN32);
-            size = ALIGN(alignedw * alignedh, ALIGN8K) + ALIGN(alignedw * ALIGN(height/2, ALIGN32), ALIGN8K);
+            size = ALIGN(alignedw * alignedh, ALIGN8K) + ALIGN(alignedw * ALIGN((height+1)/2, ALIGN32), ALIGN8K);
             break;
         case NV12_2K: {
             alignedw = ALIGN(width, ALIGN16);
@@ -657,9 +712,9 @@ size_t C2DColorConverter::calcSize(ColorConvertFormat format, size_t width, size
             size = ALIGN(alignedw * alignedh + (alignedw * ALIGN(height/2, ALIGN256)), ALIGN4K);
             break;
         case NV12_128m:
-            alignedw = ALIGN(width, ALIGN128);
-            alignedh = ALIGN(height, ALIGN32);
-            size = ALIGN(alignedw * alignedh + (alignedw * ALIGN(height/2, ALIGN16)), ALIGN4K);
+            alignedw = VENUS_Y_STRIDE(COLOR_FMT_NV12, width);
+            alignedh = VENUS_Y_SCANLINES(COLOR_FMT_NV12, height);
+            size = ALIGN(alignedw * alignedh + (alignedw * ALIGN((height+1)/2, VENUS_Y_SCANLINES(COLOR_FMT_NV12, 1)/2)), ALIGN4K);
             break;
         case NV12_UBWC:
             size = VENUS_BUFFER_SIZE(COLOR_FMT_NV12_UBWC, width, height);
@@ -667,11 +722,19 @@ size_t C2DColorConverter::calcSize(ColorConvertFormat format, size_t width, size
         case TP10_UBWC:
             size = VENUS_BUFFER_SIZE(COLOR_FMT_NV12_BPP10_UBWC, width, height);
             break;
-        case CbYCrY:
-            size = ALIGN(ALIGN(width * 2, ALIGN64) * height, ALIGN4K);
+        case P010:
+            alignedw = ALIGN(width*2, ALIGN64);
+            size = (alignedw * height) + (alignedw * height / 2);
             break;
-        case RGBA8888_UBWC:
-            size = VENUS_BUFFER_SIZE(COLOR_FMT_RGBA8888_UBWC, width, height);
+        case VENUS_P010:
+            // Y plane
+            alignedw = ALIGN(width*2, ALIGN256);
+            alignedh = ALIGN(height, ALIGN32);
+            size = (alignedw * alignedh);
+            // UV plane
+            alignedw = ALIGN(width*2, ALIGN256);
+            alignedh = ALIGN(height/2, ALIGN16);
+            size = ALIGN(size + (alignedw * alignedh), ALIGN4K);
             break;
         default:
             ALOGW("%s: Format not supported , %d", __FUNCTION__, format);
@@ -686,7 +749,6 @@ void * C2DColorConverter::getMappedGPUAddr(int bufFD, void *bufPtr, size_t bufLe
 {
     C2D_STATUS status;
     void *gpuaddr = NULL;
-
     status = mC2DMapAddr(bufFD, bufPtr, bufLen, 0, KGSL_USER_MEM_TYPE_ION,
                          &gpuaddr);
     if (status != C2D_STATUS_OK) {
@@ -696,7 +758,6 @@ void * C2DColorConverter::getMappedGPUAddr(int bufFD, void *bufPtr, size_t bufLe
     }
     ALOGV("%s: c2d mapping created: gpuaddr %p fd %d ptr %p len %zu",
           __FUNCTION__, gpuaddr, bufFD, bufPtr, bufLen);
-
     return gpuaddr;
 }
 
@@ -730,9 +791,8 @@ bool C2DColorConverter::getBuffFilledLen(int32_t port, unsigned int &filled_leng
   C2DBuffReq req;
   if (enabled) {
     ret = getBuffReq(port, &req);
-    if (ret && req.bpp.denominator > 0) {
-      filled_length = (req.stride * req.sliceHeight * req.bpp.numerator);
-      filled_length /= req.bpp.denominator;
+    if (ret) {
+      filled_length = req.size;
     }
   }
 
@@ -781,6 +841,8 @@ size_t C2DColorConverter::calcLumaAlign(ColorConvertFormat format) {
           return 1;
         case NV12_UBWC:
         case TP10_UBWC:
+        case P010:
+        case VENUS_P010:
           return ALIGN4K;
         default:
           ALOGW("%s: unknown format (%d) passed for luma alignment number.",
@@ -800,7 +862,8 @@ size_t C2DColorConverter::calcSizeAlign(ColorConvertFormat format) {
         case NV12_128m:
         case NV12_UBWC:
         case TP10_UBWC:
-        case RGBA8888_UBWC:
+        case P010:
+        case VENUS_P010:
           return ALIGN4K;
         default:
           ALOGW("%s: unknown format (%d) passed for size alignment number",
@@ -831,6 +894,8 @@ C2DBytesPerPixel C2DColorConverter::calcBytesPerPixel(ColorConvertFormat format)
         case NV12_128m:
         case NV12_UBWC:
         case TP10_UBWC:
+        case P010:
+        case VENUS_P010:
             bpp.numerator = 3;
             bpp.denominator = 2;
             break;
@@ -875,8 +940,8 @@ int32_t C2DColorConverter::dumpOutput(char * filename, char mode) {
           //dump Cb/Cr
           base = (uint8_t *)dstSurfaceDef->plane1;
           stride = dstSurfaceDef->stride1;
-          for (size_t i = 0; i < sliceHeight/2;i++) { //will work only for the 420 ones
-            ret = write(fd, base, mDstWidth/2);
+          for (size_t i = 0; i < (sliceHeight+1)/2;i++) { //will work only for the 420 ones
+            ret = write(fd, base, (mDstWidth+1)/2);
             if (ret < 0) goto cleanup;
             base += stride;
           }
@@ -885,8 +950,8 @@ int32_t C2DColorConverter::dumpOutput(char * filename, char mode) {
           base = (uint8_t *)dstSurfaceDef->plane2;
           stride = dstSurfaceDef->stride2;
 
-          for (size_t i = 0; i < sliceHeight/2;i++) { //will work only for the 420 ones
-            ret = write(fd, base, mDstWidth/2);
+          for (size_t i = 0; i < (sliceHeight+1)/2;i++) { //will work only for the 420 ones
+            ret = write(fd, base, (mDstWidth+1)/2);
             if (ret < 0) goto cleanup;
             base += stride;
           }
@@ -895,7 +960,7 @@ int32_t C2DColorConverter::dumpOutput(char * filename, char mode) {
           /* dump chroma */
           base = (uint8_t *)dstSurfaceDef->plane1;
           stride = dstSurfaceDef->stride1;
-          for (size_t i = 0; i < sliceHeight/2;i++) { //will work only for the 420 ones
+          for (size_t i = 0; i < (sliceHeight+1)/2;i++) { //will work only for the 420 ones
             ret = write(fd, base, mDstWidth);
             if (ret < 0) goto cleanup;
             base += stride;

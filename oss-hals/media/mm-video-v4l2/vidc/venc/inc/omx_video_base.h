@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2010-2019, The Linux Foundation. All rights reserved.
+Copyright (c) 2010-2020, The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are
@@ -65,7 +65,6 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <linux/videodev2.h>
 #include <dlfcn.h>
 #include "C2DColorConverter.h"
-#include "vidc_debug.h"
 #include <vector>
 #include "vidc_vendor_extensions.h"
 
@@ -79,6 +78,7 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #undef LOG_TAG
 #define LOG_TAG "OMX-VENC"
+#include "vidc_debug.h"
 
 #ifdef _ANDROID_
 using namespace android;
@@ -152,7 +152,6 @@ enum omx_venc_extradata_types {
     VENC_EXTRADATA_MBINFO = 0x400,
     VENC_EXTRADATA_FRAMEDIMENSION = 0x1000000,
     VENC_EXTRADATA_YUV_STATS = 0x800,
-    VENC_EXTRADATA_VQZIP = 0x02000000,
     VENC_EXTRADATA_ROI = 0x04000000,
 };
 
@@ -178,10 +177,6 @@ struct venc_bufferpayload{
 	unsigned int	offset;
 	unsigned int	maped_size;
 	unsigned long	filled_len;
-};
-
-struct	venc_voptimingcfg{
-	unsigned long	voptime_resolution;
 };
 
 struct venc_framerate{
@@ -237,6 +232,7 @@ class omx_video: public qc_omx_component
         ColorConvertFormat  mC2dDestFmt;
         OMX_U32 mC2DFrameHeight;
         OMX_U32 mC2DFrameWidth;
+        bool is_stop_in_progress;
 
         omx_video();  // constructor
         virtual ~omx_video();  // destructor
@@ -269,6 +265,8 @@ class omx_video: public qc_omx_component
         virtual bool dev_free_buf(void *,unsigned) = 0;
         virtual bool dev_empty_buf(void *, void *,unsigned,unsigned) = 0;
         virtual bool dev_fill_buf(void *buffer, void *,unsigned,unsigned) = 0;
+        virtual bool dev_is_meta_mode() = 0;
+        virtual bool dev_is_avtimer_needed() = 0;
         virtual bool dev_get_buf_req(OMX_U32 *,OMX_U32 *,OMX_U32 *,OMX_U32) = 0;
         virtual bool dev_get_dimensions(OMX_U32 ,OMX_U32 *,OMX_U32 *) = 0;
         virtual bool is_streamon_done(OMX_U32 port) = 0;
@@ -280,11 +278,9 @@ class omx_video: public qc_omx_component
         virtual bool is_secure_session(void) = 0;
         virtual int dev_handle_output_extradata(void*, int) = 0;
         virtual int dev_set_format(int) = 0;
-        virtual bool dev_query_cap(struct v4l2_queryctrl &) = 0;
         virtual bool dev_is_video_session_supported(OMX_U32 width, OMX_U32 height) = 0;
         virtual bool dev_get_capability_ltrcount(OMX_U32 *, OMX_U32 *, OMX_U32 *) = 0;
         virtual bool dev_get_vui_timing_info(OMX_U32 *) = 0;
-        virtual bool dev_get_vqzip_sei_info(OMX_U32 *) = 0;
         virtual bool dev_get_peak_bitrate(OMX_U32 *) = 0;
         virtual bool dev_get_batch_size(OMX_U32 *) = 0;
         virtual bool dev_buffer_ready_to_queue(OMX_BUFFERHEADERTYPE *buffer) = 0;
@@ -299,7 +295,7 @@ class omx_video: public qc_omx_component
                         OMX_U32 height) = 0;
         virtual bool dev_get_output_log_flag() = 0;
         virtual int dev_output_log_buffers(const char *buffer_addr, int buffer_len, uint64_t timestamp) = 0;
-        virtual int dev_extradata_log_buffers(char *buffer_addr, bool input) = 0;
+        virtual int dev_extradata_log_buffers(char *buffer_addr, int index, bool input) = 0;
         virtual bool dev_get_hevc_profile(OMX_U32*) = 0;
         virtual bool dev_handle_client_input_extradata(void*) = 0;
         virtual void dev_get_color_format_as_string(char * buf, int buf_len, unsigned colorformat) = 0;
@@ -399,9 +395,6 @@ class omx_video: public qc_omx_component
                 void *               eglImage);
 
         Signal signal;
-
-        bool reject_param_for_TME_mode(int index);
-        bool reject_config_for_TME_mode(int index);
 
         pthread_t msg_thread_id;
         pthread_t async_thread_id;
@@ -633,7 +626,11 @@ class omx_video: public qc_omx_component
         client_extradata_info m_client_in_extradata_info;
 
         void complete_pending_buffer_done_cbs();
+        bool is_rotation_enabled();
         bool is_conv_needed(private_handle_t *handle);
+        bool is_flip_conv_needed(private_handle_t *handle);
+        OMX_ERRORTYPE do_flip_conversion(struct pmem *buffer);
+        void initFastCV();
         void print_debug_color_aspects(ColorAspects *aspects, const char *prefix);
 
         OMX_ERRORTYPE get_vendor_extension_config(
@@ -686,8 +683,6 @@ class omx_video: public qc_omx_component
         OMX_VIDEO_PARAM_VP8TYPE m_sParamVP8;
         OMX_VIDEO_PARAM_ANDROID_VP8ENCODERTYPE m_sParamVP8Encoder;
         OMX_VIDEO_PARAM_HEVCTYPE m_sParamHEVC;
-        QOMX_VIDEO_PARAM_TMETYPE m_sParamTME;
-        OMX_U32 tme_payload_version;
         OMX_PORT_PARAM_TYPE m_sPortParam_img;
         OMX_PORT_PARAM_TYPE m_sPortParam_audio;
         OMX_VIDEO_CONFIG_BITRATETYPE m_sConfigBitrate;
@@ -711,7 +706,6 @@ class omx_video: public qc_omx_component
         QOMX_VIDEO_CONFIG_LTRUSE_TYPE m_sConfigLTRUse;
         QOMX_VIDEO_CONFIG_LTRMARK_TYPE m_sConfigLTRMark;
         OMX_VIDEO_CONFIG_AVCINTRAPERIOD m_sConfigAVCIDRPeriod;
-        OMX_VIDEO_CONFIG_DEINTERLACE m_sConfigDeinterlace;
         OMX_VIDEO_VP8REFERENCEFRAMETYPE m_sConfigVp8ReferenceFrame;
         QOMX_VIDEO_HIERARCHICALLAYERS m_sHierLayers;
         QOMX_EXTNINDEX_VIDEO_HIER_P_LAYERS m_sHPlayers;
@@ -743,7 +737,7 @@ class omx_video: public qc_omx_component
         QOMX_ENABLETYPE m_sParamColorSpaceConversion;
         OMX_VIDEO_PARAM_ANDROID_IMAGEGRIDTYPE m_sParamAndroidImageGrid;
         QOMX_ENABLETYPE m_sParamLinearColorFormat;
-        QOMX_ENABLETYPE m_sParamNativeRecorder;
+        OMX_EXTNINDEX_VIDEO_VBV_DELAY m_sParamVbvDelay;
 
         // fill this buffer queue
         omx_cmd_queue m_ftb_q;
@@ -795,6 +789,8 @@ class omx_video: public qc_omx_component
         OMX_U64 profile_start_time;
         OMX_U64 profile_last_time;
         bool profile_etb();
+        int32_t m_no_vpss;
+        bool m_fastCV_init_done;
 };
 
 #endif // __OMX_VIDEO_BASE_H__

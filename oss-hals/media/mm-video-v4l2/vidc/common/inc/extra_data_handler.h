@@ -29,8 +29,8 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #ifndef __EXTRA_DATA_HANDLER_H__
 #define __EXTRA_DATA_HANDLER_H__
-#include <media/msm_media_info.h>
-#define FRAME_PACK_SIZE 18
+#include <media/msm_vidc_utils.h>
+
 class client_extradata_info {
     private:
         OMX_U32 size; // size of extradata of each frame

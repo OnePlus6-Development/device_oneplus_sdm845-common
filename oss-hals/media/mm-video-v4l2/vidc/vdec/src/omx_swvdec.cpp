@@ -192,36 +192,6 @@ OMX_ERRORTYPE omx_swvdec::component_init(OMX_STRING cmp_name)
         m_swvdec_codec         = SWVDEC_CODEC_H263;
         m_omx_video_codingtype = OMX_VIDEO_CodingH263;
     }
-    else if (((!strncmp(cmp_name,
-                      "OMX.qti.video.decoder.vc1sw",
-                      OMX_MAX_STRINGNAME_SIZE)))||
-              ((!strncmp(cmp_name,
-                      "OMX.qti.video.decoder.wmvsw",
-                      OMX_MAX_STRINGNAME_SIZE))))
-    {
-        char platform_name[PROP_VALUE_MAX] = {0};
-        char version[PROP_VALUE_MAX] = {0};
-        property_get("ro.board.platform", platform_name, "0");  //HW ID
-        if (!strcmp(platform_name, "sm6150"))
-        {
-            if (property_get("vendor.media.target.version", version, "0") &&
-                    (atoi(version) == 0))
-            {
-                //Sku version, VC1 is disabled on this target
-                OMX_SWVDEC_LOG_ERROR("VC1 decoder not supported on this target");
-                retval = OMX_ErrorInvalidComponentName;
-                goto component_init_exit;
-            }
-        }
-
-        OMX_SWVDEC_LOG_LOW("video_decoder.vc1");
-
-        strlcpy(m_cmp_name,              cmp_name, OMX_MAX_STRINGNAME_SIZE);
-        strlcpy(m_role_name, "video_decoder.vc1", OMX_MAX_STRINGNAME_SIZE);
-
-        m_swvdec_codec         = SWVDEC_CODEC_VC1;
-        m_omx_video_codingtype = OMX_VIDEO_CodingWMV;
-    }
     else
     {
         OMX_SWVDEC_LOG_ERROR("'%s': invalid component name", cmp_name);
@@ -249,6 +219,12 @@ OMX_ERRORTYPE omx_swvdec::component_init(OMX_STRING cmp_name)
             goto component_init_exit;
         }
 
+        if ((retval_swvdec = swvdec_check_inst_load(m_swvdec_handle)) !=
+            SWVDEC_STATUS_SUCCESS)
+        {
+            retval = retval_swvdec2omx(retval_swvdec);
+            goto component_init_exit;
+        }
         m_swvdec_created = true;
 
         if ((retval = set_frame_dimensions(DEFAULT_FRAME_WIDTH,
@@ -1177,11 +1153,6 @@ OMX_ERRORTYPE omx_swvdec::set_parameter(OMX_HANDLETYPE cmp_handle,
                                (p_meta_data->bStoreMetaData ?
                                 "enable" :
                                 "disable"));
-            if(m_swvdec_codec == SWVDEC_CODEC_VC1)
-            {
-                OMX_SWVDEC_LOG_HIGH("meta buffer mode is not supprted for vc1");
-                return OMX_ErrorUnsupportedSetting;
-            }
             if (p_meta_data->nPortIndex == OMX_CORE_PORT_INDEX_OP)
             {
                 if (p_meta_data->bStoreMetaData && m_meta_buffer_mode_disabled)
@@ -1899,7 +1870,7 @@ OMX_ERRORTYPE omx_swvdec::free_buffer(OMX_HANDLETYPE        cmp_handle,
 
         retval = OMX_ErrorBadPortIndex;
     }
-    else if (m_state != OMX_StateIdle && !(m_status_flags & (1 << PENDING_STATE_LOADED_TO_IDLE)))
+    else if (m_state != OMX_StateIdle)
     {
         if (m_state != OMX_StateExecuting)
         {
@@ -2595,26 +2566,10 @@ OMX_ERRORTYPE omx_swvdec::set_frame_attributes(
 
     case OMX_QCOM_COLOR_FormatYUV420PackedSemiPlanar32m:
     {
-        /**
-         * alignment factors:
-         *
-         * - stride:        128
-         * - scanlines_y:    32
-         * - scanlines_uv:   16
-         * - size:         4096
-         */
+        m_frame_attributes.stride = VENUS_Y_STRIDE(COLOR_FMT_NV12, width);
+        m_frame_attributes.scanlines = VENUS_Y_SCANLINES(COLOR_FMT_NV12, height);
 
-        m_frame_attributes.stride    = ALIGN(width, 128);
-        m_frame_attributes.scanlines = ALIGN(height, 32);
-
-        scanlines_uv = ALIGN(height / 2, 16);
-
-        plane_size_y  = (m_frame_attributes.stride *
-                         m_frame_attributes.scanlines);
-
-        plane_size_uv = m_frame_attributes.stride * scanlines_uv;
-
-        m_frame_attributes.size = ALIGN(plane_size_y + plane_size_uv, 4096);
+        m_frame_attributes.size = VENUS_BUFFER_SIZE(COLOR_FMT_NV12, width, height);
 
         OMX_SWVDEC_LOG_HIGH("'OMX_QCOM_COLOR_FormatYUV420PackedSemiPlanar32m': "
                             "stride %d, scanlines %d, size %d",
@@ -3200,11 +3155,11 @@ OMX_ERRORTYPE omx_swvdec::describe_color_format(
             /**
              * alignment factors:
              *
-             * - stride:    128
-             * - scanlines:  32
+             * - stride:    512 or 128
+             * - scanlines: 512 or 32
              */
-            stride    = ALIGN(p_img->mWidth,  128);
-            scanlines = ALIGN(p_img->mHeight,  32);
+            stride    = VENUS_Y_STRIDE(COLOR_FMT_NV12, p_img->mWidth);
+            scanlines = VENUS_Y_SCANLINES(COLOR_FMT_NV12, p_img->mHeight);
 
             p_img->mBitDepth = 8;
 
@@ -3590,7 +3545,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_ip(
     OMX_U32                size)
 {
     OMX_ERRORTYPE retval = OMX_ErrorNone;
-    SWVDEC_STATUS retval_swvdec = SWVDEC_STATUS_SUCCESS;
 
     unsigned int ii;
 
@@ -3601,7 +3555,8 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_ip(
                              size,
                              m_port_ip.def.nBufferSize);
 
-        return OMX_ErrorBadParameter;
+        retval = OMX_ErrorBadParameter;
+        goto buffer_allocate_ip_exit;
     }
 
     if (m_buffer_array_ip == NULL)
@@ -3612,7 +3567,7 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_ip(
 
         if ((retval = buffer_allocate_ip_info_array()) != OMX_ErrorNone)
         {
-            return retval;
+            goto buffer_allocate_ip_exit;
         }
     }
 
@@ -3641,7 +3596,8 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_ip(
 
         if (m_buffer_array_ip[ii].ion_info.dev_fd< 0)
         {
-            return OMX_ErrorInsufficientResources;
+            retval = OMX_ErrorInsufficientResources;
+            goto buffer_allocate_ip_exit;
         }
 
         pmem_fd = m_buffer_array_ip[ii].ion_info.data_fd;
@@ -3657,7 +3613,8 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_ip(
             close(pmem_fd);
             ion_memory_free(&m_buffer_array_ip[ii].ion_info);
 
-            return OMX_ErrorInsufficientResources;
+            retval = OMX_ErrorInsufficientResources;
+            goto buffer_allocate_ip_exit;
         }
 
         *pp_buffer_hdr = &m_buffer_array_ip[ii].buffer_header;
@@ -3675,23 +3632,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_ip(
         m_buffer_array_ip[ii].buffer_swvdec.fd = pmem_fd;
 
         m_buffer_array_ip[ii].buffer_populated = true;
-
-        if(m_swvdec_codec == SWVDEC_CODEC_VC1)
-        {
-            OMX_SWVDEC_LOG_LOW("map ip buffer");
-
-            if((retval_swvdec = swvdec_register_buffer(m_swvdec_handle,
-                                                       &m_buffer_array_ip[ii].buffer_swvdec))
-               != SWVDEC_STATUS_SUCCESS)
-            {
-                OMX_SWVDEC_LOG_ERROR("swvdec_map failed for ip buffer %d: %p",ii,bufferaddr);
-
-                close(pmem_fd);
-                ion_memory_free(&m_buffer_array_ip[ii].ion_info);
-
-                return retval_swvdec2omx(retval_swvdec);
-            }
-        }
 
         OMX_SWVDEC_LOG_HIGH("ip buffer %d: %p, fd = %d %d bytes",
                             ii,
@@ -3716,9 +3656,10 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_ip(
         OMX_SWVDEC_LOG_ERROR("all %d ip buffers allocated",
                              m_port_ip.def.nBufferCountActual);
 
-        return OMX_ErrorInsufficientResources;
+        retval = OMX_ErrorInsufficientResources;
     }
 
+buffer_allocate_ip_exit:
     return retval;
 }
 
@@ -3738,7 +3679,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_op(
     OMX_U32                size)
 {
     OMX_ERRORTYPE retval = OMX_ErrorNone;
-    SWVDEC_STATUS retval_swvdec = SWVDEC_STATUS_SUCCESS;
     unsigned int ii;
 
     if (size != m_port_op.def.nBufferSize)
@@ -3748,7 +3688,8 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_op(
                              size,
                              m_port_op.def.nBufferSize);
 
-        return OMX_ErrorBadParameter;
+        retval = OMX_ErrorBadParameter;
+        goto buffer_allocate_op_exit;
     }
 
     if (m_buffer_array_op == NULL)
@@ -3759,7 +3700,7 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_op(
 
         if ((retval = buffer_allocate_op_info_array()) != OMX_ErrorNone)
         {
-            return retval;
+            goto buffer_allocate_op_exit;
         }
     }
 
@@ -3788,7 +3729,8 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_op(
 
         if (m_buffer_array_op[ii].ion_info.dev_fd < 0)
         {
-            return OMX_ErrorInsufficientResources;
+            retval = OMX_ErrorInsufficientResources;
+            goto buffer_allocate_op_exit;
         }
 
         pmem_fd = m_buffer_array_op[ii].ion_info.data_fd;
@@ -3804,7 +3746,8 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_op(
             close(pmem_fd);
             ion_memory_free(&m_buffer_array_op[ii].ion_info);
 
-            return OMX_ErrorInsufficientResources;
+            retval = OMX_ErrorInsufficientResources;
+            goto buffer_allocate_op_exit;
         }
 
         *pp_buffer_hdr = &m_buffer_array_op[ii].buffer_header;
@@ -3824,20 +3767,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_op(
 
         m_buffer_array_op[ii].buffer_swvdec.fd            = pmem_fd ;
 
-        if(m_swvdec_codec == SWVDEC_CODEC_VC1)
-        {
-            OMX_SWVDEC_LOG_LOW("map op buffer");
-
-            if((retval_swvdec = swvdec_map(m_swvdec_handle,&m_buffer_array_op[ii].buffer_swvdec)) != SWVDEC_STATUS_SUCCESS)
-            {
-                OMX_SWVDEC_LOG_ERROR("swvdec_map failed for op buffer %d: %p",ii,bufferaddr);
-
-                close(pmem_fd);
-                ion_memory_free(&m_buffer_array_op[ii].ion_info);
-
-                return retval_swvdec2omx(retval_swvdec);
-            }
-        }
         OMX_SWVDEC_LOG_HIGH("op buffer %d: %p, fd = %d %d bytes",
                             ii,
                             bufferaddr,
@@ -3864,6 +3793,7 @@ OMX_ERRORTYPE omx_swvdec::buffer_allocate_op(
         retval = OMX_ErrorInsufficientResources;
     }
 
+buffer_allocate_op_exit:
     return retval;
 }
 
@@ -4012,7 +3942,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_use_op(
     OMX_U8                *p_buffer)
 {
     OMX_ERRORTYPE retval = OMX_ErrorNone;
-    SWVDEC_STATUS retval_swvdec;
     unsigned int ii;
 
     (void) size;
@@ -4123,17 +4052,7 @@ OMX_ERRORTYPE omx_swvdec::buffer_use_op(
             p_buffer_swvdec->p_client_data = (void *) ((unsigned long) ii);
             p_buffer_swvdec->fd            = p_buffer_payload->pmem_fd ;
 
-            if(m_swvdec_codec == SWVDEC_CODEC_VC1)
-            {
-                OMX_SWVDEC_LOG_LOW("map op buffer");
 
-                if((retval_swvdec = swvdec_map(m_swvdec_handle,p_buffer_swvdec)) != SWVDEC_STATUS_SUCCESS)
-                {
-                    OMX_SWVDEC_LOG_ERROR("swvdec_map failed for op buffer %d: %p",ii,p_buffer_mapped);
-                    retval = retval_swvdec2omx(retval_swvdec);;
-                    goto buffer_use_op_exit;
-                }
-            }
             m_buffer_array_op[ii].buffer_populated = true;
 
             (*pp_buffer_hdr)->pBuffer     = (m_android_native_buffers ?
@@ -4182,7 +4101,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_deallocate_ip(
     OMX_BUFFERHEADERTYPE *p_buffer_hdr)
 {
     OMX_ERRORTYPE retval = OMX_ErrorNone;
-    SWVDEC_STATUS retval_swvdec = SWVDEC_STATUS_SUCCESS;
 
     unsigned int ii;
 
@@ -4216,22 +4134,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_deallocate_ip(
     {
         if (m_buffer_array_ip[ii].buffer_payload.pmem_fd > 0)
         {
-
-           if(m_swvdec_codec == SWVDEC_CODEC_VC1)
-            {
-                SWVDEC_BUFFER *p_buffer_swvdec;
-                p_buffer_swvdec  = &m_buffer_array_ip[ii].buffer_swvdec;
-                OMX_SWVDEC_LOG_LOW("unmap ip buffer");
-
-                if((retval_swvdec = swvdec_unregister_buffer(m_swvdec_handle,p_buffer_swvdec))
-                   != SWVDEC_STATUS_SUCCESS)
-                {
-                    OMX_SWVDEC_LOG_ERROR("swvdec_unmap failed for ip buffer %d: %p",
-                                         ii,p_buffer_swvdec->p_buffer);
-                    retval = retval_swvdec2omx(retval_swvdec);;
-                }
-            }
-
             m_buffer_array_ip[ii].buffer_populated = false;
 
             m_port_ip.populated = OMX_FALSE;
@@ -4289,7 +4191,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_deallocate_op(
     OMX_BUFFERHEADERTYPE *p_buffer_hdr)
 {
     OMX_ERRORTYPE retval = OMX_ErrorNone;
-    SWVDEC_STATUS retval_swvdec = SWVDEC_STATUS_SUCCESS;
     unsigned int ii;
 
     if (p_buffer_hdr == NULL)
@@ -4320,25 +4221,13 @@ OMX_ERRORTYPE omx_swvdec::buffer_deallocate_op(
 
     if (ii < m_port_op.def.nBufferCountActual)
     {
+        pthread_mutex_lock(&m_meta_buffer_array_mutex);
         if (m_meta_buffer_mode)
         {
             // do nothing; munmap() & FD reset done in FBD or RR
         }
         else if (m_android_native_buffers)
         {
-
-            if(m_swvdec_codec == SWVDEC_CODEC_VC1)
-            {
-                SWVDEC_BUFFER *p_buffer_swvdec;
-                p_buffer_swvdec  = &m_buffer_array_op[ii].buffer_swvdec;
-                OMX_SWVDEC_LOG_LOW("unmap op buffer");
-
-                if((retval_swvdec = swvdec_unmap(m_swvdec_handle,p_buffer_swvdec)) != SWVDEC_STATUS_SUCCESS)
-                {
-                    OMX_SWVDEC_LOG_ERROR("swvdec_unmap failed for op buffer %d: %p",ii,p_buffer_swvdec->p_buffer);
-                    retval = retval_swvdec2omx(retval_swvdec);;
-                }
-            }
             ion_unmap(m_buffer_array_op[ii].buffer_payload.pmem_fd ,
                       m_buffer_array_op[ii].buffer_payload.bufferaddr,
                       m_buffer_array_op[ii].buffer_payload.mmaped_size);
@@ -4347,18 +4236,6 @@ OMX_ERRORTYPE omx_swvdec::buffer_deallocate_op(
         }
         else
         {
-            if(m_swvdec_codec == SWVDEC_CODEC_VC1)
-            {
-                SWVDEC_BUFFER *p_buffer_swvdec;
-                p_buffer_swvdec  = &m_buffer_array_op[ii].buffer_swvdec;
-                OMX_SWVDEC_LOG_LOW("unmap op buffer");
-
-                if((retval_swvdec = swvdec_unmap(m_swvdec_handle,p_buffer_swvdec)) != SWVDEC_STATUS_SUCCESS)
-                {
-                    OMX_SWVDEC_LOG_ERROR("swvdec_unmap failed for op buffer %d: %p",ii,p_buffer_swvdec->p_buffer);
-                    retval = retval_swvdec2omx(retval_swvdec);;
-                }
-            }
             ion_unmap(m_buffer_array_op[ii].buffer_payload.pmem_fd,
                       m_buffer_array_op[ii].buffer_payload.bufferaddr,
                       m_buffer_array_op[ii].buffer_payload.mmaped_size);
@@ -4393,6 +4270,7 @@ OMX_ERRORTYPE omx_swvdec::buffer_deallocate_op(
                 meta_buffer_array_deallocate();
             }
         }
+        pthread_mutex_unlock(&m_meta_buffer_array_mutex);
     }
     else
     {
@@ -4503,15 +4381,23 @@ void omx_swvdec::meta_buffer_ref_remove(unsigned int index)
 {
     pthread_mutex_lock(&m_meta_buffer_array_mutex);
 
+    if (m_meta_buffer_array == NULL || m_buffer_array_op == NULL) {
+       OMX_SWVDEC_LOG_ERROR("Invalid meta buffer");
+       pthread_mutex_unlock(&m_meta_buffer_array_mutex);
+       return;
+    }
+
     m_meta_buffer_array[index].ref_count--;
 
     if (m_meta_buffer_array[index].ref_count == 0)
     {
-        ion_unmap(m_meta_buffer_array[index].fd,
+        if (m_buffer_array_op[index].buffer_payload.pmem_fd != -1) {
+           ion_unmap(m_meta_buffer_array[index].fd,
                   m_buffer_array_op[index].buffer_payload.bufferaddr,
                   m_buffer_array_op[index].buffer_payload.mmaped_size);
+           m_meta_buffer_array[index].fd = -1;
+        }
 
-        m_meta_buffer_array[index].fd = -1;
         m_buffer_array_op[index].buffer_payload.bufferaddr  = NULL;
         m_buffer_array_op[index].buffer_payload.offset      = 0;
         m_buffer_array_op[index].buffer_payload.mmaped_size = 0;
@@ -4791,7 +4677,6 @@ void omx_swvdec::ion_memory_free(struct vdec_ion *p_ion_buf_info)
         (unsigned int)p_ion_buf_info->alloc_data.heap_id_mask);
 
     if (p_ion_buf_info->data_fd >= 0) {
-        close(p_ion_buf_info->data_fd);
         p_ion_buf_info->data_fd = -1;
     }
 
@@ -4835,9 +4720,17 @@ void omx_swvdec::swvdec_empty_buffer_done(SWVDEC_BUFFER *p_buffer_ip)
 {
     unsigned long index = (unsigned long) p_buffer_ip->p_client_data;
 
-    m_buffer_array_ip[index].buffer_header.nFilledLen =
-        p_buffer_ip->filled_length;
-
+    if (m_arbitrary_bytes_mode)
+    {
+        if (!m_buffer_array_ip[index].split_count)
+        {
+            m_buffer_array_ip[index].buffer_header.nFilledLen =
+                p_buffer_ip->filled_length;
+        }
+    }
+    else
+        m_buffer_array_ip[index].buffer_header.nFilledLen =
+            p_buffer_ip->filled_length;
     async_post_event(OMX_SWVDEC_EVENT_EBD,
                      (unsigned long) &m_buffer_array_ip[index].buffer_header,
                      index);

@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
+Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -90,6 +90,10 @@ omx_venc::omx_venc()
     m_debug.in_buffer_log = atoi(property_value);
 
     property_value[0] = '\0';
+    property_get("vendor.vidc.enc.log.in.rotated", property_value, "0");
+    m_debug.in_buffer_rotated_log = atoi(property_value);
+
+    property_value[0] = '\0';
     property_get("vendor.vidc.enc.log.out", property_value, "0");
     m_debug.out_buffer_log = atoi(property_value);
 
@@ -178,6 +182,14 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING role)
     callBackInfo.p_client                 = (void*)this;
 
     SWVENC_STATUS sRet = swvenc_init(&m_hSwVenc, m_codec, &callBackInfo);
+    if (sRet != SWVENC_S_SUCCESS)
+    {
+        DEBUG_PRINT_ERROR("swvenc_init returned %d, ret insufficient resources",
+         sRet);
+        RETURN(OMX_ErrorInsufficientResources);
+    }
+
+    sRet = swvenc_check_inst_load(m_hSwVenc);
     if (sRet != SWVENC_S_SUCCESS)
     {
         DEBUG_PRINT_ERROR("swvenc_init returned %d, ret insufficient resources",
@@ -409,7 +421,9 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING role)
     m_sParamMPEG4.bSVH = OMX_FALSE;
     m_sParamMPEG4.bGov = OMX_FALSE;
     // 2 second intra period for default outport fps
+    if(m_sOutPortFormat.xFramerate)
     m_sParamMPEG4.nPFrames = (m_sOutPortFormat.xFramerate * 2 - 1);
+
     m_sParamMPEG4.bACPred = OMX_TRUE;
     // delta = 2 @ 15 fps
     m_sParamMPEG4.nTimeIncRes = 30;
@@ -423,7 +437,9 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING role)
     OMX_INIT_STRUCT(&m_sParamH263, OMX_VIDEO_PARAM_H263TYPE);
     m_sParamH263.nPortIndex = (OMX_U32) PORT_INDEX_OUT;
     // 2 second intra period for default outport fps
+    if(m_sOutPortFormat.xFramerate)
     m_sParamH263.nPFrames = (m_sOutPortFormat.xFramerate * 2 - 1);
+
     m_sParamH263.nBFrames = 0;
     m_sParamH263.eProfile = OMX_VIDEO_H263ProfileBaseline;
     m_sParamH263.eLevel = OMX_VIDEO_H263Level10;
@@ -552,17 +568,21 @@ OMX_ERRORTYPE  omx_venc::set_parameter
                     RETURN(OMX_ErrorUnsupportedSetting);
                 }
 
-                /* set the frame size */
-                Prop.id = SWVENC_PROPERTY_ID_FRAME_SIZE;
-                Prop.info.frame_size.height = portDefn->format.video.nFrameHeight;
-                Prop.info.frame_size.width  = portDefn->format.video.nFrameWidth;
+                // don't update frame size if it's unchanged
+                if (m_sInPortDef.format.video.nFrameWidth != portDefn->format.video.nFrameWidth
+                        || m_sInPortDef.format.video.nFrameHeight != portDefn->format.video.nFrameHeight) {
+                    /* set the frame size */
+                    Prop.id = SWVENC_PROPERTY_ID_FRAME_SIZE;
+                    Prop.info.frame_size.height = portDefn->format.video.nFrameHeight;
+                    Prop.info.frame_size.width  = portDefn->format.video.nFrameWidth;
 
-                Ret = swvenc_setproperty(m_hSwVenc, &Prop);
-                if (Ret != SWVENC_S_SUCCESS)
-                {
-                   DEBUG_PRINT_ERROR("%s, swvenc_setproperty failed (%d)",
-                     __FUNCTION__, Ret);
-                   RETURN(OMX_ErrorUnsupportedSetting);
+                    Ret = swvenc_setproperty(m_hSwVenc, &Prop);
+                    if (Ret != SWVENC_S_SUCCESS)
+                    {
+                        DEBUG_PRINT_ERROR("%s, swvenc_setproperty failed (%d)",
+                                __FUNCTION__, Ret);
+                    RETURN(OMX_ErrorUnsupportedSetting);
+                    }
                 }
 
                 /* set the input frame-rate */
@@ -578,18 +598,18 @@ OMX_ERRORTYPE  omx_venc::set_parameter
                 }
 
                 /* set the frame attributes */
-                /*Align stide and scanline to worst case*/
+                /*Align stride and scanline to worst case*/
                 /*------------------------------------------------------------------------------------------
                 *           [Color Format]                   [Stride Alignment]        [Scanline Alignment]
-                * QOMX_COLOR_FORMATYUV420PackedSemiPlanar32m       128                         32
-                * OMX_COLOR_FormatYUV420SemiPlanar                 16                          16
+                * QOMX_COLOR_FORMATYUV420PackedSemiPlanar32m       512 or 128                  512 or 32
+                * OMX_COLOR_FormatYUV420SemiPlanar                 512                         512
                 * QOMX_COLOR_FormatYVU420SemiPlanar                16                          16
                 * HAL_PIXEL_FORMAT_NV21_ZSL                        64                          64
                 *------------------------------------------------------------------------------------------*/
-                y_stride = ALIGN(portDefn->format.video.nFrameWidth,128);
+                y_stride = SWVENC_Y_STRIDE(COLOR_FMT_NV12,portDefn->format.video.nFrameWidth);
                 //Slice height doesn't get updated so chroma offset calculation becomes incorrect .
                 //Using FrameHeight Instead , just for omx-test-app .
-                y_scanlines = ALIGN(portDefn->format.video.nFrameHeight,64);
+                y_scanlines = SWVENC_Y_SCANLINES(COLOR_FMT_NV12_ZSL,portDefn->format.video.nFrameHeight);
                 Prop.id = SWVENC_PROPERTY_ID_FRAME_ATTRIBUTES;
                 Prop.info.frame_attributes.stride_luma = y_stride;
                 Prop.info.frame_attributes.stride_chroma = y_stride;
@@ -824,11 +844,6 @@ OMX_ERRORTYPE  omx_venc::set_parameter
         {
             OMX_VIDEO_PARAM_BITRATETYPE* pParam = (OMX_VIDEO_PARAM_BITRATETYPE*)paramData;
             DEBUG_PRINT_LOW("set_parameter: OMX_IndexParamVideoBitrate");
-
-            if (m_max_allowed_bitrate_check)
-            {
-               //TBD: to add bitrate check
-            }
 
             /* set the output bit-rate */
             Ret = swvenc_set_bit_rate(pParam->nTargetBitrate);
@@ -1445,54 +1460,6 @@ OMX_ERRORTYPE  omx_venc::set_parameter
             break;
         }
 
-        case OMX_QcomIndexParamVideoMaxAllowedBitrateCheck:
-        {
-            QOMX_EXTNINDEX_PARAMTYPE* pParam =
-                (QOMX_EXTNINDEX_PARAMTYPE*)paramData;
-            if (pParam->nPortIndex == PORT_INDEX_OUT)
-            {
-                m_max_allowed_bitrate_check =
-                    ((pParam->bEnable == OMX_TRUE) ? true : false);
-                DEBUG_PRINT_HIGH("set_parameter: max allowed bitrate check %s",
-                        ((pParam->bEnable == OMX_TRUE) ? "enabled" : "disabled"));
-            }
-            else
-            {
-                DEBUG_PRINT_ERROR("ERROR: OMX_QcomIndexParamVideoMaxAllowedBitrateCheck "
-                        " called on wrong port(%u)", pParam->nPortIndex);
-                RETURN(OMX_ErrorBadPortIndex);
-            }
-            break;
-        }
-
-        case OMX_QcomIndexEnableSliceDeliveryMode:
-        {
-            QOMX_EXTNINDEX_PARAMTYPE* pParam =
-                (QOMX_EXTNINDEX_PARAMTYPE*)paramData;
-            if (pParam->nPortIndex == PORT_INDEX_OUT)
-            {
-                //TBD: add setprop to swvenc once the support is added
-                #if 0
-                if (!handle->venc_set_param(paramData,
-                            (OMX_INDEXTYPE)OMX_QcomIndexEnableSliceDeliveryMode)) {
-                    DEBUG_PRINT_ERROR("ERROR: Request for setting slice delivery mode failed");
-                    RETURN( OMX_ErrorUnsupportedSetting;
-                }
-                #endif
-                {
-                    DEBUG_PRINT_ERROR("ERROR: Request for setting slice delivery mode failed");
-                    RETURN(OMX_ErrorUnsupportedSetting);
-                }
-            }
-            else
-            {
-                DEBUG_PRINT_ERROR("ERROR: OMX_QcomIndexEnableSliceDeliveryMode "
-                        "called on wrong port(%u)", pParam->nPortIndex);
-                RETURN(OMX_ErrorBadPortIndex);
-            }
-            break;
-        }
-
         case OMX_QcomIndexEnableH263PlusPType:
         {
             QOMX_EXTNINDEX_PARAMTYPE* pParam =
@@ -1512,26 +1479,11 @@ OMX_ERRORTYPE  omx_venc::set_parameter
             break;
         }
 
-        case OMX_QcomIndexParamPeakBitrate:
-        {
-            DEBUG_PRINT_ERROR("ERROR: Setting peak bitrate");
-            RETURN(OMX_ErrorUnsupportedSetting);
-            break;
-        }
-
         case QOMX_IndexParamVideoInitialQp:
         {
             // TBD: applicable to RC-on case only
             DEBUG_PRINT_ERROR("ERROR: Setting Initial QP for RC-on case");
             RETURN(OMX_ErrorNone);
-            break;
-        }
-
-
-        case OMX_QcomIndexParamSetMVSearchrange:
-        {
-            DEBUG_PRINT_ERROR("ERROR: Setting Searchrange");
-            RETURN(OMX_ErrorUnsupportedSetting);
             break;
         }
 
@@ -1849,7 +1801,7 @@ OMX_ERRORTYPE omx_venc::swvenc_do_flip_inport() {
     Prop.info.frame_size.width = inHeight;
 
     DEBUG_PRINT_HIGH("setting flipped dimensions to swencoder, WxH (%d x %d)",
-            inWidth, inHeight);
+            Prop.info.frame_size.width, Prop.info.frame_size.height);
     Ret = swvenc_setproperty(m_hSwVenc, &Prop);
     if (Ret != SWVENC_S_SUCCESS) {
         // currently, set dimensions to encoder can only be called when encoder is
@@ -2388,6 +2340,7 @@ bool omx_venc::dev_empty_buf
 
     if (m_debug.in_buffer_log)
     {
+       // dump before rotation, un-rotated buffer
        swvenc_input_log_buffers((const char*)ipbuffer.p_buffer, ipbuffer.filled_length);
     }
 
@@ -2395,6 +2348,11 @@ bool omx_venc::dev_empty_buf
         if(!swvenc_do_rotate((int)fd, ipbuffer, (OMX_U32)index)) {
             DEBUG_PRINT_ERROR("rotate failed");
             return OMX_ErrorUndefined;
+        }
+        if (m_debug.in_buffer_rotated_log) {
+            // dump after rotation, rotated buffer
+            DEBUG_PRINT_ERROR("dump rotated");
+            swvenc_input_log_rotated_buffers((const char*)ipbuffer.p_buffer, ipbuffer.filled_length);
         }
     }
 
@@ -2533,16 +2491,6 @@ bool omx_venc::dev_get_vui_timing_info(OMX_U32 *enabled)
     RETURN(false);
 }
 
-bool omx_venc::dev_get_vqzip_sei_info(OMX_U32 *enabled)
-{
-    ENTER_FUNC();
-
-    (void)enabled;
-    DEBUG_PRINT_ERROR("Get vqzip sei info is not supported");
-
-    RETURN(false);
-}
-
 bool omx_venc::dev_get_peak_bitrate(OMX_U32 *peakbitrate)
 {
     //TBD: store the peak bitrate in class and return here;
@@ -2598,12 +2546,9 @@ OMX_ERRORTYPE omx_venc::dev_get_supported_profile_level(OMX_VIDEO_PARAM_PROFILEL
             if (profileLevelType->nProfileIndex == 0)
             {
                 profileLevelType->eProfile = OMX_VIDEO_MPEG4ProfileSimple;
-                #ifdef DISABLE_720P
-                    profileLevelType->eLevel   = OMX_VIDEO_MPEG4Level5;
-                #else
-                    profileLevelType->eLevel   = OMX_VIDEO_MPEG4Level6;
-                #endif
-                DEBUG_PRINT_LOW("MPEG-4 simple profile, level %d",profileLevelType->eLevel);
+                profileLevelType->eLevel   = OMX_VIDEO_MPEG4Level5;
+
+                DEBUG_PRINT_LOW("MPEG-4 simple profile, level 5");
             }
             else
             {
@@ -2822,12 +2767,6 @@ int omx_venc::dev_set_format(int color)
     //return handle->venc_set_format(color);
 }
 
-bool omx_venc::dev_query_cap(struct v4l2_queryctrl &cap)
-{
-    (void)cap;
-    RETURN(true);
-}
-
 bool omx_venc::dev_get_dimensions(OMX_U32 index, OMX_U32 *width, OMX_U32 *height)
 {
    ENTER_FUNC();
@@ -2835,6 +2774,20 @@ bool omx_venc::dev_get_dimensions(OMX_U32 index, OMX_U32 *width, OMX_U32 *height
    (void)index;
    (void)width;
    (void)height;
+
+   RETURN(true);
+}
+
+bool omx_venc::dev_is_meta_mode()
+{
+   ENTER_FUNC();
+
+   RETURN(true);
+}
+
+bool omx_venc::dev_is_avtimer_needed()
+{
+   ENTER_FUNC();
 
    RETURN(true);
 }
@@ -2873,8 +2826,8 @@ int omx_venc::dev_output_log_buffers(const char *buffer, int bufferlen, uint64_t
     if (m_debug.out_buffer_log && !m_debug.outfile)
     {
         int size = 0;
-        int width = m_sInPortDef.format.video.nFrameWidth;
-        int height = m_sInPortDef.format.video.nFrameHeight;
+        int width = m_sOutPortDef.format.video.nFrameWidth;
+        int height = m_sOutPortDef.format.video.nFrameHeight;
         if(SWVENC_CODEC_MPEG4 == m_codec)
         {
            size = snprintf(m_debug.outfile_name, PROPERTY_VALUE_MAX,
@@ -2960,11 +2913,65 @@ int omx_venc::swvenc_input_log_buffers(const char *buffer, int bufferlen)
    RETURN(0);
 }
 
-int omx_venc::dev_extradata_log_buffers(char *buffer, bool input)
+int omx_venc::swvenc_input_log_rotated_buffers(const char *buffer, int bufferlen)
+{
+   int width = m_sInPortDef.format.video.nFrameWidth;
+   int height = m_sInPortDef.format.video.nFrameHeight;
+   if (m_bIsInFlipDone) {
+       auto v = width;
+       width = height;
+       height = v;
+   }
+   int stride = SWVENC_Y_STRIDE(COLOR_FMT_NV12, width);
+   int scanlines = SWVENC_Y_SCANLINES(COLOR_FMT_NV12, height);
+   char *temp = (char*)buffer;
+
+   if (!m_debug.inrotatedfile)
+   {
+       int size = snprintf(m_debug.inrotatedfile_name, PROPERTY_VALUE_MAX,
+                      "%s/input_enc_rotated_%d_%d_%p.yuv",
+                      m_debug.log_loc, width, height, this);
+       if ((size > PROPERTY_VALUE_MAX) || (size < 0))
+       {
+           DEBUG_PRINT_ERROR("Failed to open input rotated file: %s for logging size:%d",
+                              m_debug.inrotatedfile_name, size);
+           RETURN(-1);
+       }
+       DEBUG_PRINT_LOW("input rotated filename = %s", m_debug.inrotatedfile_name);
+       m_debug.inrotatedfile = fopen (m_debug.inrotatedfile_name, "ab");
+       if (!m_debug.inrotatedfile)
+       {
+           DEBUG_PRINT_HIGH("Failed to open input rotated file: %s for logging",
+              m_debug.inrotatedfile_name);
+           m_debug.inrotatedfile_name[0] = '\0';
+           RETURN(-1);
+       }
+   }
+   if (m_debug.inrotatedfile && buffer && bufferlen)
+   {
+       DEBUG_PRINT_LOW("%s buffer length: %d", __func__, bufferlen);
+       for (int i = 0; i < height; i++)
+       {
+          fwrite(temp, width, 1, m_debug.inrotatedfile);
+          temp += stride;
+       }
+       temp = (char*)(buffer + (stride * scanlines));
+       for(int i = 0; i < height/2; i++)
+       {
+          fwrite(temp, width, 1, m_debug.inrotatedfile);
+          temp += stride;
+      }
+   }
+
+   RETURN(0);
+}
+
+int omx_venc::dev_extradata_log_buffers(char *buffer, int index, bool input)
 {
    ENTER_FUNC();
 
    (void)buffer;
+   (void)index;
    (void)input;
 
    RETURN(true);
@@ -3360,11 +3367,6 @@ SWVENC_STATUS omx_venc::swvenc_set_profile_level
           case OMX_VIDEO_MPEG4Level5:
              Level.mpeg4 = SWVENC_LEVEL_MPEG4_5;
              break;
-#ifndef DISABLE_720P
-          case OMX_VIDEO_MPEG4Level6:
-             Level.mpeg4 = SWVENC_LEVEL_MPEG4_6;
-             break;
-#endif
           default:
              DEBUG_PRINT_ERROR("ERROR: UNKNOWN LEVEL");
              Ret = SWVENC_S_FAILURE;
@@ -3577,8 +3579,8 @@ bool omx_venc::swvenc_color_align(OMX_BUFFERHEADERTYPE *buffer, OMX_U32 width,
                         OMX_U32 height)
 {
     OMX_U32 y_stride,y_scanlines,uv_scanlines,plane_size_y,plane_size_uv,src_chroma_offset;
-    y_stride = ALIGN(width,128);
-    y_scanlines = ALIGN(height,32);
+    y_stride = SWVENC_Y_STRIDE(COLOR_FMT_NV12,width);
+    y_scanlines = SWVENC_Y_SCANLINES(COLOR_FMT_NV12,height);
     src_chroma_offset = width * height;
     OMX_U32 buffersize = SWVENC_BUFFER_SIZE(COLOR_FMT_NV12,width,height);
     if (buffer->nAllocLen >= buffersize) {
@@ -3624,10 +3626,10 @@ SWVENC_STATUS omx_venc::swvenc_set_color_format
         DEBUG_PRINT_ERROR("QOMX_COLOR_FORMATYUV420PackedSemiPlanar32m");
         swvenc_color_format = SWVENC_COLOR_FORMAT_NV12;
         Prop.id = SWVENC_PROPERTY_ID_FRAME_ATTRIBUTES;
-        Prop.info.frame_attributes.stride_luma = ALIGN(m_sOutPortDef.format.video.nFrameWidth,128);
-        Prop.info.frame_attributes.stride_chroma = ALIGN(m_sOutPortDef.format.video.nFrameWidth,128);
+        Prop.info.frame_attributes.stride_luma = SWVENC_Y_STRIDE(COLOR_FMT_NV12, m_sOutPortDef.format.video.nFrameWidth);
+        Prop.info.frame_attributes.stride_chroma = SWVENC_Y_STRIDE(COLOR_FMT_NV12, m_sOutPortDef.format.video.nFrameWidth);
         Prop.info.frame_attributes.offset_luma = 0;
-        Prop.info.frame_attributes.offset_chroma = ((ALIGN(m_sOutPortDef.format.video.nFrameWidth,128)) * (ALIGN(m_sOutPortDef.format.video.nFrameHeight,32)));
+        Prop.info.frame_attributes.offset_chroma = ((SWVENC_Y_STRIDE(COLOR_FMT_NV12, m_sOutPortDef.format.video.nFrameWidth)) * (SWVENC_Y_SCANLINES(COLOR_FMT_NV12, m_sOutPortDef.format.video.nFrameHeight)));
         Ret = swvenc_setproperty(m_hSwVenc, &Prop);
         if (Ret != SWVENC_S_SUCCESS)
         {
@@ -3640,10 +3642,10 @@ SWVENC_STATUS omx_venc::swvenc_set_color_format
     {
         swvenc_color_format = SWVENC_COLOR_FORMAT_NV12;
         Prop.id = SWVENC_PROPERTY_ID_FRAME_ATTRIBUTES;
-        Prop.info.frame_attributes.stride_luma = ALIGN(m_sInPortDef.format.video.nFrameWidth,128);
-        Prop.info.frame_attributes.stride_chroma = ALIGN(m_sInPortDef.format.video.nFrameWidth,128);
+        Prop.info.frame_attributes.stride_luma = SWVENC_Y_STRIDE(COLOR_FMT_NV12, m_sInPortDef.format.video.nFrameWidth);
+        Prop.info.frame_attributes.stride_chroma = SWVENC_Y_STRIDE(COLOR_FMT_NV12, m_sInPortDef.format.video.nFrameWidth);
         Prop.info.frame_attributes.offset_luma = 0;
-        Prop.info.frame_attributes.offset_chroma = ((ALIGN(m_sInPortDef.format.video.nFrameWidth,128)) * (ALIGN(m_sInPortDef.format.video.nFrameHeight,32)));
+        Prop.info.frame_attributes.offset_chroma = ((SWVENC_Y_STRIDE(COLOR_FMT_NV12, m_sInPortDef.format.video.nFrameWidth)) * (SWVENC_Y_SCANLINES(COLOR_FMT_NV12, m_sInPortDef.format.video.nFrameHeight)));
         Ret = swvenc_setproperty(m_hSwVenc, &Prop);
         if (Ret != SWVENC_S_SUCCESS)
         {
@@ -3673,10 +3675,10 @@ SWVENC_STATUS omx_venc::swvenc_set_color_format
         DEBUG_PRINT_ERROR("HAL_PIXEL_FORMAT_NV21_ZSL");
         swvenc_color_format = SWVENC_COLOR_FORMAT_NV21;
         Prop.id = SWVENC_PROPERTY_ID_FRAME_ATTRIBUTES;
-        Prop.info.frame_attributes.stride_luma = ALIGN(m_sInPortDef.format.video.nFrameWidth,64);
-        Prop.info.frame_attributes.stride_chroma = ALIGN(m_sInPortDef.format.video.nFrameWidth,64);
+        Prop.info.frame_attributes.stride_luma = SWVENC_Y_STRIDE(COLOR_FMT_NV12_ZSL, m_sInPortDef.format.video.nFrameWidth);
+        Prop.info.frame_attributes.stride_chroma = SWVENC_Y_STRIDE(COLOR_FMT_NV12_ZSL, m_sInPortDef.format.video.nFrameWidth);
         Prop.info.frame_attributes.offset_luma = 0;
-        Prop.info.frame_attributes.offset_chroma = ((ALIGN(m_sInPortDef.format.video.nFrameWidth,64)) * (ALIGN(m_sInPortDef.format.video.nFrameHeight,64)));
+        Prop.info.frame_attributes.offset_chroma = ((SWVENC_Y_STRIDE(COLOR_FMT_NV12_ZSL, m_sInPortDef.format.video.nFrameWidth)) * (SWVENC_Y_SCANLINES(COLOR_FMT_NV12_ZSL, m_sInPortDef.format.video.nFrameHeight)));
         Ret = swvenc_setproperty(m_hSwVenc, &Prop);
         if (Ret != SWVENC_S_SUCCESS)
         {

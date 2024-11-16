@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -69,10 +69,15 @@ typedef enum {
     vidc_dec_conceal_color_8bit,
     vidc_dec_conceal_color_10bit,
     vidc_enc_csc_custom_matrix,
-    vidc_dec_arb_mode_override,
     vidc_perf_control_enable,
     vidc_enc_linear_color_format,
     vidc_enc_bitrate_savings_enable,
+    vidc_enc_auto_blur_disable,
+    vidc_dec_thumbnail_yuv_output,
+    vidc_no_vpss,
+    vidc_disable_hdr,
+    vidc_enc_quality_boost_enable,
+    vidc_dec_output_rate,
 } Config_t;
 
 struct configStr {
@@ -91,10 +96,15 @@ static const struct configStr configStrMap[] = {
     {vidc_dec_conceal_color_8bit, "vidc_dec_conceal_color_8bit"},
     {vidc_dec_conceal_color_10bit, "vidc_dec_conceal_color_10bit"},
     {vidc_enc_csc_custom_matrix, "vidc_enc_csc_custom_matrix"},
-    {vidc_dec_arb_mode_override, "vidc_dec_arb_mode_override"},
     {vidc_perf_control_enable, "vidc_perf_control_enable"},
     {vidc_enc_linear_color_format, "vidc_enc_linear_color_format"},
     {vidc_enc_bitrate_savings_enable, "vidc_enc_bitrate_savings_enable"},
+    {vidc_enc_auto_blur_disable, "vidc_enc_auto_blur_disable"},
+    {vidc_dec_thumbnail_yuv_output, "vidc_dec_thumbnail_yuv_output"},
+    {vidc_no_vpss, "vidc_no_vpss"},
+    {vidc_disable_hdr, "vidc_disable_hdr"},
+    {vidc_enc_quality_boost_enable, "vidc_enc_quality_boost_enable"},
+    {vidc_dec_output_rate, "vidc_dec_output_rate"},
 };
 
 class Config {

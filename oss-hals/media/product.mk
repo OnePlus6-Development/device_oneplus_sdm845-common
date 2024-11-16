@@ -1,4 +1,4 @@
-#MSM_VIDC_TARGET_LIST := msmnile
+MSM_VIDC_TARGET_LIST := kona lito bengal
 
 ifeq ($(call is-board-platform-in-list, $(QCOM_BOARD_PLATFORMS)),true)
 
@@ -19,14 +19,11 @@ MM_VIDEO += libOmxSwVencMpeg4
 MM_VIDEO += libOmxVdec
 MM_VIDEO += libOmxVenc
 MM_VIDEO += libstagefrighthw
+MM_VIDEO += init.qti.media.sh
 
 PRODUCT_PACKAGES += $(MM_VIDEO)
 
-ifeq ($(call is-board-platform-in-list, msmnile $(MSMSTEPPE) atoll $(TRINKET)),true)
 include hardware/qcom/media/conf_files/$(TARGET_BOARD_PLATFORM)/$(TARGET_BOARD_PLATFORM).mk
-else ifeq ($(TARGET_BOARD_PLATFORM), sdmshrike)
-include hardware/qcom/media/conf_files/msmnile/msmnile.mk
-endif
 
 endif
 

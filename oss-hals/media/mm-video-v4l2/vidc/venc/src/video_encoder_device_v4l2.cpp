@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2010-2018, 2020, The Linux Foundation. All rights reserved.
+Copyright (c) 2010-2020 The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -35,9 +35,6 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "video_encoder_device_v4l2.h"
 #include "omx_video_encoder.h"
 #include "media/msm_vidc_utils.h"
-#ifdef HYPERVISOR
-#include "hypv_intercept.h"
-#endif
 #ifdef USE_ION
 #include <linux/msm_ion.h>
 #endif
@@ -67,11 +64,6 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define YUV_STATS_LIBRARY_NAME "libgpustats.so" // UBWC case: use GPU library
 
-#ifdef HYPERVISOR
-#define ioctl(x, y, z) hypv_ioctl(x, y, z)
-#define poll(x, y, z)  hypv_poll(x, y, z)
-#endif
-
 #undef ALIGN
 #define ALIGN(x, to_align) ((((unsigned long) x) + (to_align - 1)) & ~(to_align - 1))
 #define EXTRADATA_IDX(__num_planes) ((__num_planes) ? (__num_planes) - 1 : 0)
@@ -97,25 +89,11 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define Log2(number, power)  { OMX_U32 temp = number; power = 0; while( (0 == (temp & 0x1)) &&  power < 16) { temp >>=0x1; power++; } }
 #define Q16ToFraction(q,num,den) { OMX_U32 power; Log2(q,power);  num = q >> power; den = 0x1 << (16 - power); }
 
+//TODO: remove once gerrit : 2680400 is merged
+#define VIDC_HAL_PIXEL_FORMAT_NV12_LINEAR_FLEX  HAL_PIXEL_FORMAT_NV12_LINEAR_FLEX
+#define VIDC_HAL_PIXEL_FORMAT_NV12_UBWC_FLEX HAL_PIXEL_FORMAT_NV12_UBWC_FLEX
+
 #define BUFFER_LOG_LOC "/data/vendor/media"
-
-#define OMX_VIDEO_LEVEL_UNKNOWN 0
-
-#define VENC_BFRAME_MAX_COUNT       1
-#define VENC_BFRAME_MAX_FPS         60
-#define VENC_BFRAME_MAX_WIDTH       1920
-#define VENC_BFRAME_MAX_HEIGHT      1088
-#define VENC_INFINITE_GOP 0xFFFFFFF
-
-/* TODO: Use sanctioned vendor bits for HEIF
- * once end to end 64-bit support is available.
- */
-#define GRALLOC_USAGE_PRIVATE_HEIF_VIDEO (UINT32_C(1) << 27)
-#define GRALLOC_USAGE_PRIVATE_10BIT_VIDEO (UINT32_C(1) << 30)
-
-#define REQUEST_LINEAR_COLOR_8_BIT   0x1
-#define REQUEST_LINEAR_COLOR_10_BIT  0x2
-#define REQUEST_LINEAR_COLOR_ALL     (REQUEST_LINEAR_COLOR_8_BIT | REQUEST_LINEAR_COLOR_10_BIT)
 
 #undef LOG_TAG
 #define LOG_TAG "OMX-VENC: venc_dev"
@@ -142,20 +120,24 @@ venc_dev::venc_dev(class omx_venc *venc_class)
     color_format = 0;
     hw_overload = false;
     mBatchSize = 0;
-    deinterlace_enabled = false;
     m_roi_enabled = false;
-    m_roi_type = 0;
+    m_roi_type = ROI_NONE;
+    m_cvp_meta_enabled = false;
+    m_cvp_first_metadata = false;
     low_latency_mode = false;
+    m_bDimensionsNeedFlip = false;
     pthread_mutex_init(&m_roilock, NULL);
+    pthread_mutex_init(&m_configlock, NULL);
     pthread_mutex_init(&pause_resume_mlock, NULL);
     pthread_cond_init(&pause_resume_cond, NULL);
     memset(&input_extradata_info, 0, sizeof(input_extradata_info));
-    input_extradata_info.ion.data_fd = -1;
     memset(&output_extradata_info, 0, sizeof(output_extradata_info));
-    output_extradata_info.ion.data_fd = -1;
+    for (int i = 0; i < VIDEO_MAX_FRAME; i++) {
+        input_extradata_info.ion[i].data_fd = -1;
+        output_extradata_info.ion[i].data_fd = -1;
+    }
     memset(&idrperiod, 0, sizeof(idrperiod));
     memset(&multislice, 0, sizeof(multislice));
-    memset (&slice_mode, 0 , sizeof(slice_mode));
     memset(&m_sVenc_cfg, 0, sizeof(m_sVenc_cfg));
     memset(&rate_ctrl, 0, sizeof(rate_ctrl));
     memset(&bitrate, 0, sizeof(bitrate));
@@ -174,26 +156,14 @@ venc_dev::venc_dev(class omx_venc *venc_class)
     memset(&voptimecfg, 0, sizeof(voptimecfg));
     memset(&capability, 0, sizeof(capability));
     memset(&m_debug,0,sizeof(m_debug));
-    is_searchrange_set = false;
-    enable_mv_narrow_searchrange = false;
-    supported_rc_modes = RC_ALL;
-    memset(&vqzip_sei_info, 0, sizeof(vqzip_sei_info));
-    memset(&ltrinfo, 0, sizeof(ltrinfo));
-    memset(&fd_list, 0, sizeof(fd_list));
-    sess_priority.priority = 0;
+    sess_priority.priority = 1;
     operating_rate = 30;
     memset(&color_space, 0x0, sizeof(color_space));
     memset(&temporal_layers_config, 0x0, sizeof(temporal_layers_config));
-    client_req_disable_bframe   = false;
     bframe_implicitly_enabled = false;
-    client_req_disable_temporal_layers  = false;
-    client_req_turbo_mode  = false;
     intra_period.num_pframes = 29;
     intra_period.num_bframes = 0;
-    mIsNativeRecorder = false;
     m_hdr10meta_enabled = false;
-    hdr10metadata_supported = false;
-    is_hevcprofile_explicitly_set = false;
 
     Platform::Config::getInt32(Platform::vidc_enc_log_in,
             (int32_t *)&m_debug.in_buffer_log, 0);
@@ -201,6 +171,10 @@ venc_dev::venc_dev(class omx_venc *venc_class)
             (int32_t *)&m_debug.out_buffer_log, 0);
     Platform::Config::getInt32(Platform::vidc_enc_csc_custom_matrix,
             (int32_t *)&is_csc_custom_matrix_enabled, 0);
+    Platform::Config::getInt32(Platform::vidc_enc_auto_blur_disable,
+            (int32_t *)&is_auto_blur_disabled, 0);
+    Platform::Config::getInt32(Platform::vidc_disable_hdr,
+            (int32_t *)&m_disable_hdr, 0);
 
     char property_value[PROPERTY_VALUE_MAX] = {0};
 
@@ -213,6 +187,9 @@ venc_dev::venc_dev(class omx_venc *venc_class)
 
     property_get("vendor.vidc.enc.log.extradata", property_value, "0");
     m_debug.extradata_log = atoi(property_value);
+
+    property_get("vendor.vidc.cvp.log.in", property_value, "0");
+    m_debug.cvp_log |= atoi(property_value);
 
 #ifdef _UBWC_
     property_get("vendor.gralloc.disable_ubwc", property_value, "0");
@@ -236,7 +213,10 @@ venc_dev::venc_dev(class omx_venc *venc_class)
     Platform::Config::getInt32(Platform::vidc_enc_linear_color_format,
             (int32_t *)&mUseLinearColorFormat, 0);
     Platform::Config::getInt32(Platform::vidc_enc_bitrate_savings_enable,
-            (int32_t *)&mBitrateSavingsEnable, 0);
+            (int32_t *)&mBitrateSavingsEnable, 3);
+    Platform::Config::getInt32(Platform::vidc_enc_quality_boost_enable,
+            (int32_t *)&mQualityBoostRequested, 0);
+    mQualityBoostEligible = false;
 
     profile_level_converter::init();
 }
@@ -255,6 +235,16 @@ venc_dev::~venc_dev()
         pthread_mutex_unlock(&m_roilock);
     }
     pthread_mutex_destroy(&m_roilock);
+
+    std::list<dynamicConfig>::iterator iter;
+    pthread_mutex_lock(&m_configlock);
+    for (iter = m_configlist.begin(); iter != m_configlist.end(); iter++) {
+        DEBUG_PRINT_HIGH("dynamic config data with timestamp (%lld) should have been removed already",
+            iter->timestamp);
+    }
+    m_configlist.clear();
+    pthread_mutex_unlock(&m_configlock);
+    pthread_mutex_destroy(&m_configlock);
 }
 
 void* venc_dev::async_venc_message_thread (void *input)
@@ -341,7 +331,7 @@ void* venc_dev::async_venc_message_thread (void *input)
                 venc_msg.buf.flags = 0;
                 venc_msg.buf.ptrbuffer = (OMX_U8 *)omx_venc_base->m_pOutput_pmem[v4l2_buf.index].buffer;
                 venc_msg.buf.clientdata=(void*)omxhdr;
-                venc_msg.buf.timestamp = (uint64_t) v4l2_buf.timestamp.tv_sec * (uint64_t) 1000000 + (uint64_t) v4l2_buf.timestamp.tv_usec;
+                venc_msg.buf.timestamp = (int64_t) v4l2_buf.timestamp.tv_sec * (int64_t) 1000000 + (int64_t) v4l2_buf.timestamp.tv_usec;
 
                 /* TODO: ideally report other types of frames as well
                  * for now it doesn't look like IL client cares about
@@ -355,10 +345,10 @@ void* venc_dev::async_venc_message_thread (void *input)
                     venc_msg.buf.flags |= OMX_VIDEO_PictureTypeP;
                 }
 
-                if (v4l2_buf.flags & V4L2_QCOM_BUF_FLAG_CODECCONFIG)
+                if (v4l2_buf.flags & V4L2_BUF_FLAG_CODECCONFIG)
                     venc_msg.buf.flags |= OMX_BUFFERFLAG_CODECCONFIG;
 
-                if (v4l2_buf.flags & V4L2_QCOM_BUF_FLAG_EOS)
+                if (v4l2_buf.flags & V4L2_BUF_FLAG_EOS)
                     venc_msg.buf.flags |= OMX_BUFFERFLAG_EOS;
 
                 if (omx->handle->num_output_planes > 1 && v4l2_buf.m.planes->bytesused)
@@ -458,19 +448,26 @@ void* venc_dev::async_venc_message_thread (void *input)
         }
 
         /* calc avg. fps, bitrate */
-        struct timeval tv;
-        gettimeofday(&tv,NULL);
-        OMX_U64 time_diff = (OMX_U32)((tv.tv_sec * 1000000 + tv.tv_usec) -
-                (stats.prev_tv.tv_sec * 1000000 + stats.prev_tv.tv_usec));
-        if (time_diff >= 5000000) {
+        OMX_U64 current_time;
+        OMX_U64 prev_time;
+        struct timespec curr_tv;
+        clock_gettime(CLOCK_MONOTONIC, &curr_tv);
+        current_time = (OMX_U64)curr_tv.tv_sec * 1000000000ULL + (OMX_U64)curr_tv.tv_nsec;
+        prev_time = (OMX_U64)stats.prev_tv.tv_sec * 1000000000ULL + (OMX_U64)stats.prev_tv.tv_nsec;
+        if (current_time < prev_time) {
+            stats.prev_tv = curr_tv;
+            stats.bytes_generated = 0;
+            stats.prev_fbd = omx->handle->fbd;
+        } else if (current_time - prev_time  >= 1000000000ULL) {    // timestamp is in nano_seconds
             OMX_U32 num_fbd = omx->handle->fbd - stats.prev_fbd;
+            OMX_U64 time_diff = current_time - prev_time;
             if (stats.prev_tv.tv_sec && num_fbd && time_diff) {
-                float framerate = num_fbd * 1000000/(float)time_diff;
-                OMX_U32 bitrate = (stats.bytes_generated * 8 / num_fbd) * framerate;
-                DEBUG_PRINT_INFO("stats: avg. fps %0.2f, bitrate %d",
+                float framerate = ((OMX_U64)num_fbd * 1000000000ULL) / (float)time_diff;
+                OMX_U64 bitrate = ((OMX_U64)stats.bytes_generated * 8 / (float)num_fbd) * framerate;
+                DEBUG_PRINT_INFO("stats: avg. fps %0.2f, bitrate %llu",
                     framerate, bitrate);
             }
-            stats.prev_tv = tv;
+            stats.prev_tv = curr_tv;
             stats.bytes_generated = 0;
             stats.prev_fbd = omx->handle->fbd;
         }
@@ -526,7 +523,7 @@ static OMX_ERRORTYPE subscribe_to_events(int fd)
     return eRet;
 }
 
-bool venc_dev::venc_query_cap(struct v4l2_queryctrl &cap) {
+bool inline venc_dev::venc_query_cap(struct v4l2_queryctrl &cap) {
 
     if (ioctl(m_nDriver_fd, VIDIOC_QUERYCTRL, &cap)) {
         DEBUG_PRINT_ERROR("Query caps for id = %u failed", cap.id);
@@ -535,7 +532,7 @@ bool venc_dev::venc_query_cap(struct v4l2_queryctrl &cap) {
     return true;
 }
 
-bool inline venc_dev::venc_validate_range(OMX_S32 id, OMX_S32 val) {
+bool venc_dev::venc_validate_range(OMX_S32 id, OMX_S32 val) {
 
     struct v4l2_queryctrl cap;
     memset(&cap, 0, sizeof(struct v4l2_queryctrl));
@@ -581,89 +578,92 @@ void venc_dev::get_roi_for_timestamp(struct roidata &roi, OMX_TICKS timestamp)
     pthread_mutex_unlock(&m_roilock);
 }
 
-int venc_dev::append_mbi_extradata(void *dst, struct msm_vidc_extradata_header* src)
+bool venc_dev::handle_dynamic_config(OMX_BUFFERHEADERTYPE *bufferHdr)
 {
-    OMX_QCOM_EXTRADATA_MBINFO *mbi = (OMX_QCOM_EXTRADATA_MBINFO *)dst;
+    std::list<dynamicConfig>::iterator iter;
+    OMX_TICKS timestamp = bufferHdr->nTimeStamp;
+    bool ret = false;
 
-    if (!dst || !src)
-        return 0;
-
-    /* TODO: Once Venus 3XX target names are known, nFormat should 2 for those
-     * targets, since the payload format will be different */
-    mbi->nFormat = 2;
-    mbi->nDataSize = src->data_size;
-    memcpy(&mbi->data, &src->data, src->data_size);
-
-    return mbi->nDataSize + sizeof(*mbi);
-}
-
-inline int get_yuv_size(unsigned long fmt, int width, int height) {
-    unsigned int y_stride, uv_stride, y_sclines,
-                uv_sclines, y_plane, uv_plane;
-    unsigned int y_ubwc_plane = 0, uv_ubwc_plane = 0;
-    unsigned size = 0;
-
-    y_stride = VENUS_Y_STRIDE(fmt, width);
-    uv_stride = VENUS_UV_STRIDE(fmt, width);
-    y_sclines = VENUS_Y_SCANLINES(fmt, height);
-    uv_sclines = VENUS_UV_SCANLINES(fmt, height);
-
-    switch (fmt) {
-        case COLOR_FMT_NV12:
-            y_plane = y_stride * y_sclines;
-            uv_plane = uv_stride * uv_sclines;
-            size = MSM_MEDIA_ALIGN(y_plane + uv_plane, 4096);
-            break;
-         default:
-            break;
+    pthread_mutex_lock(&m_configlock);
+    iter = m_configlist.begin();
+    while (iter != m_configlist.end()) {
+        if (iter->timestamp > timestamp) {
+            iter++;
+            continue;
+        }
+        DEBUG_PRINT_LOW("found dynamic config with timestamp %lld us", iter->timestamp);
+        switch ((int)iter->type) {
+            case OMX_QcomIndexConfigVideoLTRUse:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_QcomIndexConfigVideoLTRUse");
+                if (!venc_config_useLTR(&iter->config_data.useltr))
+                    goto bailout;
+                break;
+            case OMX_QcomIndexConfigVideoLTRMark:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_QcomIndexConfigVideoLTRMark");
+                if (!venc_config_markLTR(&iter->config_data.markltr))
+                    goto bailout;
+                break;
+            case OMX_IndexConfigVideoFramerate:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_IndexConfigVideoFramerate");
+                if (!venc_config_framerate(&iter->config_data.framerate))
+                    goto bailout;
+                break;
+            case OMX_QcomIndexConfigQp:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_QcomIndexConfigQp");
+                if (!venc_config_qp(&iter->config_data.configqp))
+                    goto bailout;
+                break;
+            case QOMX_IndexConfigVideoIntraperiod:
+                DEBUG_PRINT_LOW("handle_dynamic_config:QOMX_IndexConfigVideoIntraperiod");
+                if (!set_nP_frames(iter->config_data.intraperiod.nPFrames))
+                    goto bailout;
+                break;
+            case OMX_IndexConfigVideoVp8ReferenceFrame:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_IndexConfigVideoVp8ReferenceFrame");
+                if (!venc_config_vp8refframe(&iter->config_data.vp8refframe))
+                    goto bailout;
+                break;
+            case OMX_IndexConfigVideoIntraVOPRefresh:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_IndexConfigVideoIntraVOPRefresh");
+                if (!venc_config_intravoprefresh(&iter->config_data.intravoprefresh))
+                    goto bailout;
+                break;
+            case OMX_IndexConfigVideoBitrate:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_IndexConfigVideoBitrate");
+                if (!venc_config_bitrate(&iter->config_data.bitrate))
+                    goto bailout;
+                break;
+            case OMX_IndexConfigCommonMirror:
+                DEBUG_PRINT_LOW("handle_dynamic_config: OMX_IndexConfigCommonMirror");
+                if (!strncmp(venc_handle->m_platform, "bengal", 6) && (venc_handle->m_no_vpss)) {
+                    DEBUG_PRINT_HIGH("Unsupported dynamic config on this target");
+                    ret = true;
+                    goto bailout;
+                } else if (!venc_set_mirror(iter->config_data.mirror.eMirror)) {
+                    goto bailout;
+                }
+                break;
+            default:
+                DEBUG_PRINT_ERROR("Unsupported dynamic config type %d with timestamp %lld us", iter->type, iter->timestamp);
+                goto bailout;
+        }
+        iter = m_configlist.erase(iter);
     }
-    return size;
-}
+    ret = true;
 
-void venc_dev::append_extradata_mbidata(OMX_OTHER_EXTRADATATYPE *p_extra,
-            struct msm_vidc_extradata_header *p_extradata)
-{
-    OMX_U32 payloadSize = append_mbi_extradata(&p_extra->data, p_extradata);
-    p_extra->nSize = ALIGN(sizeof(OMX_OTHER_EXTRADATATYPE) + payloadSize - sizeof(unsigned int), 4);
-    p_extra->nVersion.nVersion = OMX_SPEC_VERSION;
-    p_extra->nPortIndex = OMX_DirOutput;
-    p_extra->eType = (OMX_EXTRADATATYPE)OMX_ExtraDataVideoEncoderMBInfo;
-    p_extra->nDataSize = payloadSize;
-
-}
-
-void venc_dev::append_extradata_ltrinfo(OMX_OTHER_EXTRADATATYPE *p_extra,
-            struct msm_vidc_extradata_header *p_extradata)
-{
-    p_extra->nSize = ALIGN(sizeof(OMX_OTHER_EXTRADATATYPE) + p_extradata->data_size  - sizeof(unsigned int), 4);
-    p_extra->nVersion.nVersion = OMX_SPEC_VERSION;
-    p_extra->nPortIndex = OMX_DirOutput;
-    p_extra->eType = (OMX_EXTRADATATYPE) OMX_ExtraDataVideoLTRInfo;
-    p_extra->nDataSize = p_extradata->data_size;
-    memcpy(p_extra->data, p_extradata->data, p_extradata->data_size);
-}
-
-void venc_dev::append_extradata_none(OMX_OTHER_EXTRADATATYPE *p_extra)
-{
-    p_extra->nSize = ALIGN(sizeof(OMX_OTHER_EXTRADATATYPE), 4);
-    p_extra->nVersion.nVersion = OMX_SPEC_VERSION;
-    p_extra->nPortIndex = OMX_DirOutput;
-    p_extra->eType = OMX_ExtraDataNone;
-    p_extra->nDataSize = 0;
+bailout:
+    pthread_mutex_unlock(&m_configlock);
+    return ret;
 }
 
 bool venc_dev::handle_input_extradata(struct v4l2_buffer buf)
 {
-    OMX_OTHER_EXTRADATATYPE *p_extra = NULL;
-    unsigned int consumed_len = 0, filled_len = 0;
-    unsigned int yuv_size = 0, index = 0;
-    int enable = 0, i = 0, size = 0;
-    unsigned char *pVirt = NULL;
+    unsigned int filled_len = 0;
+    unsigned int index = buf.index;
     int height = m_sVenc_cfg.input_height;
     int width = m_sVenc_cfg.input_width;
-    OMX_TICKS nTimeStamp = buf.timestamp.tv_sec * 1000000 + buf.timestamp.tv_usec;
-    int fd = buf.m.planes[0].reserved[0];
-    bool vqzip_sei_found = false;
+    OMX_TICKS nTimeStamp = static_cast<OMX_TICKS>(buf.timestamp.tv_sec) * 1000000 + buf.timestamp.tv_usec;
+    int fd = buf.m.planes[0].reserved[MSM_VIDC_BUFFER_FD];
     char *p_extradata = NULL;
     OMX_OTHER_EXTRADATATYPE *data = NULL;
     struct roidata roi;
@@ -676,103 +676,41 @@ bool venc_dev::handle_input_extradata(struct v4l2_buffer buf)
         return true;
     }
 
-    if (!input_extradata_info.uaddr) {
+    if (!input_extradata_info.ion[index].uaddr) {
         DEBUG_PRINT_ERROR("Extradata buffers not allocated\n");
         return true;
     }
 
     DEBUG_PRINT_HIGH("Processing Extradata for Buffer = %lld", nTimeStamp); // Useful for debugging
-    sync_start_rw(input_extradata_info.ion.data_fd);
-    if (m_sVenc_cfg.inputformat == V4L2_PIX_FMT_NV12 || m_sVenc_cfg.inputformat == V4L2_PIX_FMT_NV21) {
-        size = VENUS_BUFFER_SIZE(COLOR_FMT_NV12, width, height);
-        yuv_size = get_yuv_size(COLOR_FMT_NV12, width, height);
-        pVirt = (unsigned char *)mmap(NULL, size, PROT_READ|PROT_WRITE,MAP_SHARED, fd, 0);
-        if (pVirt == MAP_FAILED) {
-            DEBUG_PRINT_ERROR("%s Failed to mmap",__func__);
-            status = false;
-            goto bailout;
-        }
-        p_extra = (OMX_OTHER_EXTRADATATYPE *) ((unsigned long)(pVirt + yuv_size + 3)&(~3));
-    }
+    sync_start_rw(input_extradata_info.ion[index].data_fd);
 
-    if (!venc_get_index_from_fd(fd, &index)) {
-        status = false;
-        goto bailout;
-    }
-    p_extradata = input_extradata_info.uaddr + index * input_extradata_info.buffer_size;
+    p_extradata = input_extradata_info.ion[index].uaddr;
     data = (struct OMX_OTHER_EXTRADATATYPE *)p_extradata;
     memset((void *)(data), 0, (input_extradata_info.buffer_size)); // clear stale data in current buffer
 
-    while (p_extra && (consumed_len + sizeof(OMX_OTHER_EXTRADATATYPE)) <= (size - yuv_size)
-        && (consumed_len + p_extra->nSize) <= (size - yuv_size)
-        && (filled_len + sizeof(OMX_OTHER_EXTRADATATYPE) <= input_extradata_info.buffer_size)
-        && (filled_len + p_extra->nSize <= input_extradata_info.buffer_size)
-        && (p_extra->eType != (OMX_EXTRADATATYPE)MSM_VIDC_EXTRADATA_NONE)) {
+    if (m_cvp_meta_enabled && !(buf.flags & V4L2_BUF_FLAG_CVPMETADATA_SKIP)) {
+        packet_size = sizeof(struct msm_vidc_extradata_header) - sizeof(unsigned int)
+                           + cvpMetadata.size;
 
-        DEBUG_PRINT_LOW("Extradata Type = 0x%x", (OMX_QCOM_EXTRADATATYPE)p_extra->eType);
-        switch ((OMX_QCOM_EXTRADATATYPE)p_extra->eType) {
-        case OMX_ExtraDataFrameDimension:
-        {
-            struct msm_vidc_extradata_index *payload;
-            OMX_QCOM_EXTRADATA_FRAMEDIMENSION *framedimension_format;
-            data->nSize = (sizeof(OMX_OTHER_EXTRADATATYPE) + sizeof(struct msm_vidc_extradata_index) + 3)&(~3);
+        if (filled_len + packet_size <= input_extradata_info.buffer_size) {
+            struct  msm_vidc_enc_cvp_metadata_payload *payload_cvp;
+            data->nSize = ALIGN(packet_size, 4);
             data->nVersion.nVersion = OMX_SPEC_VERSION;
-            data->nPortIndex = 0;
-            data->eType = (OMX_EXTRADATATYPE)MSM_VIDC_EXTRADATA_INDEX;
-            data->nDataSize = sizeof(struct msm_vidc_input_crop_payload);
-            framedimension_format = (OMX_QCOM_EXTRADATA_FRAMEDIMENSION *)p_extra->data;
-            payload = (struct msm_vidc_extradata_index *)(data->data);
-            payload->type = MSM_VIDC_EXTRADATA_INPUT_CROP;
-            payload->input_crop.left = framedimension_format->nDecWidth;
-            payload->input_crop.top = framedimension_format->nDecHeight;
-            payload->input_crop.width = framedimension_format->nActualWidth;
-            payload->input_crop.height = framedimension_format->nActualHeight;
-            DEBUG_PRINT_LOW("Height = %d Width = %d Actual Height = %d Actual Width = %d",
-                framedimension_format->nDecWidth, framedimension_format->nDecHeight,
-                framedimension_format->nActualWidth, framedimension_format->nActualHeight);
+            data->nPortIndex = PORT_INDEX_IN;
+            data->eType = (OMX_EXTRADATATYPE)MSM_VIDC_EXTRADATA_CVP_METADATA;
+            data->nDataSize = cvpMetadata.size;
+            payload_cvp = (struct  msm_vidc_enc_cvp_metadata_payload *)(data->data);
+            memcpy(payload_cvp->data, cvpMetadata.payload, cvpMetadata.size);
             filled_len += data->nSize;
             data = (OMX_OTHER_EXTRADATATYPE *)((char *)data + data->nSize);
-            break;
+        } else {
+            DEBUG_PRINT_ERROR("Insufficient size for CVPMetadata: required %u buffer_size %lu filled_len %u",
+               packet_size, input_extradata_info.buffer_size, filled_len);
+            status = false;
+            goto bailout;
         }
-        case OMX_ExtraDataQP:
-        {
-            OMX_QCOM_EXTRADATA_QP * qp_payload = NULL;
-            struct msm_vidc_frame_qp_payload *payload;
-            data->nSize = (sizeof(OMX_OTHER_EXTRADATATYPE) + sizeof(struct msm_vidc_frame_qp_payload) + 3)&(~3);
-            data->nVersion.nVersion = OMX_SPEC_VERSION;
-            data->nPortIndex = 0;
-            data->eType = (OMX_EXTRADATATYPE)MSM_VIDC_EXTRADATA_FRAME_QP;
-            data->nDataSize = sizeof(struct  msm_vidc_frame_qp_payload);
-            qp_payload = (OMX_QCOM_EXTRADATA_QP *)p_extra->data;
-            payload = (struct  msm_vidc_frame_qp_payload *)(data->data);
-            payload->frame_qp = qp_payload->nQP;
-            DEBUG_PRINT_LOW("Frame QP = %d", payload->frame_qp);
-            filled_len += data->nSize;
-            data = (OMX_OTHER_EXTRADATATYPE *)((char *)data + data->nSize);
-            break;
-        }
-        case OMX_ExtraDataVQZipSEI:
-            DEBUG_PRINT_LOW("VQZIP SEI Found ");
-            input_extradata_info.vqzip_sei_found = true;
-            break;
-        case OMX_ExtraDataFrameInfo:
-        {
-            OMX_QCOM_EXTRADATA_FRAMEINFO *frame_info = NULL;
-            frame_info = (OMX_QCOM_EXTRADATA_FRAMEINFO *)(p_extra->data);
-            if (frame_info->ePicType == OMX_VIDEO_PictureTypeI) {
-                if (venc_set_intra_vop_refresh((OMX_BOOL)true) == false)
-                    DEBUG_PRINT_ERROR("%s Error in requesting I Frame ", __func__);
-            }
-            break;
-        }
-        default:
-            DEBUG_PRINT_HIGH("Unknown Extradata 0x%x", (OMX_QCOM_EXTRADATATYPE)p_extra->eType);
-            break;
-        }
-
-        consumed_len += p_extra->nSize;
-        p_extra = (OMX_OTHER_EXTRADATATYPE *)((char *)p_extra + p_extra->nSize);
     }
+    cvpMetadata.size = 0;
 
       /*
        * Below code is based on these points.
@@ -900,35 +838,14 @@ bool venc_dev::handle_input_extradata(struct v4l2_buffer buf)
         }
     }
 
-#ifdef _VQZIP_
-    if (vqzip_sei_info.enabled && !input_extradata_info.vqzip_sei_found) {
-        DEBUG_PRINT_ERROR("VQZIP is enabled, But no VQZIP SEI found. Rejecting the session");
-        if (pVirt)
-            munmap(pVirt, size);
-        status = false;
-        goto bailout; //This should be treated as fatal error
-    }
-    if (vqzip_sei_info.enabled && pVirt) {
-        data->nSize = (sizeof(OMX_OTHER_EXTRADATATYPE) +  sizeof(struct VQZipStats) + 3)&(~3);
-        data->nVersion.nVersion = OMX_SPEC_VERSION;
-        data->nPortIndex = 0;
-        data->eType = (OMX_EXTRADATATYPE)MSM_VIDC_EXTRADATA_YUVSTATS_INFO;
-        data->nDataSize = sizeof(struct VQZipStats);
-        vqzip.fill_stats_data((void*)pVirt, (void*) data->data);
-        data = (OMX_OTHER_EXTRADATATYPE *)((char *)data + data->nSize);
-    }
-#endif
-        data->nSize = sizeof(OMX_OTHER_EXTRADATATYPE);
-        data->nVersion.nVersion = OMX_SPEC_VERSION;
-        data->eType = OMX_ExtraDataNone;
-        data->nDataSize = 0;
-        data->data[0] = 0;
-
-    if (pVirt)
-        munmap(pVirt, size);
+    data->nSize = sizeof(OMX_OTHER_EXTRADATATYPE);
+    data->nVersion.nVersion = OMX_SPEC_VERSION;
+    data->eType = OMX_ExtraDataNone;
+    data->nDataSize = 0;
+    data->data[0] = 0;
 
 bailout:
-    sync_end_rw(input_extradata_info.ion.data_fd);
+    sync_end_rw(input_extradata_info.ion[index].data_fd);
     return status;
 }
 
@@ -980,10 +897,8 @@ bool venc_dev::venc_handle_client_input_extradata(void *buffer)
 bool venc_dev::handle_output_extradata(void *buffer, int index)
 {
     OMX_BUFFERHEADERTYPE *p_bufhdr = (OMX_BUFFERHEADERTYPE *) buffer;
-    OMX_OTHER_EXTRADATATYPE *p_extra = NULL;
     OMX_OTHER_EXTRADATATYPE *p_clientextra = NULL;
-    OMX_U32 remaining_extradata_size = 0;
-    OMX_U32 remaining_client_extradata_size = 0;
+    struct msm_vidc_extradata_header *p_extradata = NULL;
     OMX_U32 remaining_fw_extradata_size = 0;
 
     if(venc_handle->m_client_output_extradata_mem_ptr && venc_handle->m_sExtraData
@@ -994,134 +909,39 @@ bool venc_dev::handle_output_extradata(void *buffer, int index)
     }
     if (p_clientextra == NULL) {
         DEBUG_PRINT_ERROR("Client Extradata buffers not allocated\n");
+        return false;
     }
 
-    if (!output_extradata_info.uaddr) {
+    if (!output_extradata_info.ion[index].uaddr) {
         DEBUG_PRINT_ERROR("Extradata buffers not allocated\n");
         return false;
     }
+    p_extradata = (struct msm_vidc_extradata_header *)output_extradata_info.ion[index].uaddr;
 
-    p_extra = (OMX_OTHER_EXTRADATATYPE *)ALIGN(p_bufhdr->pBuffer +
-                p_bufhdr->nOffset + p_bufhdr->nFilledLen, 4);
+    memcpy(p_clientextra, p_extradata, output_extradata_info.buffer_size);
 
-    if (output_extradata_info.buffer_size >
-            p_bufhdr->nAllocLen - ALIGN(p_bufhdr->nOffset + p_bufhdr->nFilledLen, 4)) {
-        DEBUG_PRINT_ERROR("Insufficient buffer size for extradata");
-        p_extra = NULL;
-        return false;
-    } else if (sizeof(msm_vidc_extradata_header) != sizeof(OMX_OTHER_EXTRADATATYPE)) {
-        /* A lot of the code below assumes this condition, so error out if it's not met */
-        DEBUG_PRINT_ERROR("Extradata ABI mismatch");
-        return false;
-    }
-    remaining_extradata_size = p_bufhdr->nAllocLen - ALIGN(p_bufhdr->nOffset +
-                                                           p_bufhdr->nFilledLen, 4);
-    if(p_clientextra){
-       remaining_client_extradata_size = (venc_handle->m_client_output_extradata_mem_ptr +
-                                          index)->nAllocLen;
-    }
+    /* just for debugging */
     remaining_fw_extradata_size = output_extradata_info.buffer_size;
-
-    struct msm_vidc_extradata_header *p_extradata = NULL;
-    do {
-        DEBUG_PRINT_LOW("Remaining size for: extradata= %d client= %d fw= %d ",\
-                        remaining_extradata_size,remaining_client_extradata_size,\
-                        remaining_fw_extradata_size);
-
-        if (remaining_fw_extradata_size < sizeof(OMX_OTHER_EXTRADATATYPE)) {
-           DEBUG_PRINT_ERROR("Insufficient space for extradata");
-           break;
-        }
-        p_extradata = (struct msm_vidc_extradata_header *) (p_extradata ?
-            ((char *)p_extradata) + p_extradata->size :
-            output_extradata_info.uaddr + index * output_extradata_info.buffer_size);
-
-        if ((remaining_fw_extradata_size < p_extradata->size)) {
-           DEBUG_PRINT_ERROR("Corrupt extradata");
-           break;
-        }
-        remaining_fw_extradata_size -= p_extradata->size;
-
-        if (remaining_extradata_size < p_extradata->size){
-           DEBUG_PRINT_ERROR("insufficient size available in extradata port buffer");
-           break;
-        }
-
-        if(p_clientextra){
-           if (remaining_client_extradata_size < p_extradata->size) {
-              DEBUG_PRINT_ERROR("insufficient size available in client buffer");
-              break;
-           }
-        }
+    while (remaining_fw_extradata_size >= sizeof(OMX_OTHER_EXTRADATATYPE) &&
+            remaining_fw_extradata_size >= p_extradata->size &&
+            p_extradata->type != MSM_VIDC_EXTRADATA_NONE) {
 
         switch (p_extradata->type) {
-            case MSM_VIDC_EXTRADATA_METADATA_MBI:
+            case MSM_VIDC_EXTRADATA_METADATA_LTRINFO:
             {
-                append_extradata_mbidata(p_extra, p_extradata);
-                if(p_clientextra) {
-                     append_extradata_mbidata(p_clientextra, p_extradata);
-                }
-                DEBUG_PRINT_LOW("MBI Extradata = 0x%x", *((OMX_U32 *)p_extra->data));
+                DEBUG_PRINT_LOW("LTRInfo Extradata = 0x%x", *((OMX_U32 *)p_extradata->data));
                 break;
             }
-            case MSM_VIDC_EXTRADATA_METADATA_LTR:
-            {
-                append_extradata_ltrinfo(p_extra, p_extradata);
-                if(p_clientextra) {
-                    append_extradata_ltrinfo(p_clientextra, p_extradata);
-                }
-                DEBUG_PRINT_LOW("LTRInfo Extradata = 0x%x", *((OMX_U32 *)p_extra->data));
-                break;
-            }
-            case MSM_VIDC_EXTRADATA_NONE:
-                append_extradata_none(p_extra);
-                if(p_clientextra) {
-                    append_extradata_none(p_clientextra);
-                }
-                break;
             default:
                 /* No idea what this stuff is, just skip over it */
                 DEBUG_PRINT_HIGH("Found an unrecognised extradata (%x) ignoring it",
                         p_extradata->type);
-                continue;
+                break;
         }
 
-        remaining_extradata_size-= p_extra->nSize;
-        if(p_clientextra) {
-            remaining_client_extradata_size -= p_clientextra->nSize;
-            DEBUG_PRINT_LOW("Client Extradata Size= %u",p_clientextra->nSize);
-        }
-
-        DEBUG_PRINT_LOW("Extradata Size= %u FW= %d",\
-                        p_extra->nSize,p_extradata->size);
-
-        p_extra = (OMX_OTHER_EXTRADATATYPE *)(((char *)p_extra) + p_extra->nSize);
-        if(p_clientextra) {
-            p_clientextra = (OMX_OTHER_EXTRADATATYPE *)(((char *)p_clientextra) + p_clientextra->nSize);
-        }
-    } while (p_extradata->type != MSM_VIDC_EXTRADATA_NONE);
-
-    /* Just for debugging: Traverse the list of extra datas  and spit it out onto log */
-    p_extra = (OMX_OTHER_EXTRADATATYPE *)ALIGN(p_bufhdr->pBuffer +
-                p_bufhdr->nOffset + p_bufhdr->nFilledLen, 4);
-    remaining_extradata_size = p_bufhdr->nAllocLen - ALIGN(p_bufhdr->nOffset +
-                                                           p_bufhdr->nFilledLen, 4);
-    while(p_extra->eType != OMX_ExtraDataNone)
-    {
-        DEBUG_PRINT_LOW("Remaining size for: extradata= %d",remaining_extradata_size);
-        if (remaining_extradata_size < p_extra->nSize){
-           DEBUG_PRINT_ERROR("insufficient size available in extradata port buffer");
-           break;
-        }
-
-        DEBUG_PRINT_LOW("[%p/%u] found extradata type %x of size %u (%u) at %p",
-                p_bufhdr->pBuffer, (unsigned int)p_bufhdr->nFilledLen, p_extra->eType,
-                (unsigned int)p_extra->nSize, (unsigned int)p_extra->nDataSize, p_extra);
-
-        remaining_extradata_size-= p_extra->nSize;
-
-        p_extra = (OMX_OTHER_EXTRADATATYPE *) (((OMX_U8 *) p_extra) +
-                p_extra->nSize);
+        remaining_fw_extradata_size -= p_extradata->size;
+        p_extradata = (struct msm_vidc_extradata_header *) (
+            ((char *)p_extradata) + p_extradata->size);
     }
 
     return true;
@@ -1157,21 +977,26 @@ int venc_dev::venc_set_format(int format)
 OMX_ERRORTYPE venc_dev::venc_get_supported_profile_level(OMX_VIDEO_PARAM_PROFILELEVELTYPE *profileLevelType)
 {
     OMX_ERRORTYPE eRet = OMX_ErrorNone;
-    struct v4l2_queryctrl profile_cap, level_cap;
+    struct v4l2_queryctrl profile_cap, level_cap, tier_cap;
     int v4l2_profile;
+    char platform_name[PROP_VALUE_MAX] = {0};
+    char version[PROP_VALUE_MAX] = {0};
+
     int avc_profiles[5] = { QOMX_VIDEO_AVCProfileConstrainedBaseline,
                             QOMX_VIDEO_AVCProfileBaseline,
                             QOMX_VIDEO_AVCProfileMain,
                             QOMX_VIDEO_AVCProfileConstrainedHigh,
                             QOMX_VIDEO_AVCProfileHigh };
-    int hevc_profiles[4] = { OMX_VIDEO_HEVCProfileMain,
+    int hevc_profiles[5] = { OMX_VIDEO_HEVCProfileMain,
                              OMX_VIDEO_HEVCProfileMain10,
+                             OMX_VIDEO_HEVCProfileMainStill,
                              OMX_VIDEO_HEVCProfileMain10HDR10,
-                             OMX_VIDEO_HEVCProfileMainStill};
+                             OMX_VIDEO_HEVCProfileMain10HDR10Plus };
 
     if (!profileLevelType)
         return OMX_ErrorBadParameter;
 
+    memset(&tier_cap, 0, sizeof(struct v4l2_queryctrl));
     memset(&level_cap, 0, sizeof(struct v4l2_queryctrl));
     memset(&profile_cap, 0, sizeof(struct v4l2_queryctrl));
 
@@ -1180,9 +1005,11 @@ OMX_ERRORTYPE venc_dev::venc_get_supported_profile_level(OMX_VIDEO_PARAM_PROFILE
         profile_cap.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
     } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8) {
         level_cap.id = V4L2_CID_MPEG_VIDC_VIDEO_VP8_PROFILE_LEVEL;
+        profile_cap.id = V4L2_CID_MPEG_VIDEO_VP8_PROFILE;
     } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
-        level_cap.id = V4L2_CID_MPEG_VIDC_VIDEO_HEVC_TIER_LEVEL;
-        profile_cap.id = V4L2_CID_MPEG_VIDC_VIDEO_HEVC_PROFILE;
+        tier_cap.id = V4L2_CID_MPEG_VIDEO_HEVC_TIER;
+        level_cap.id = V4L2_CID_MPEG_VIDEO_HEVC_LEVEL;
+        profile_cap.id = V4L2_CID_MPEG_VIDEO_HEVC_PROFILE;
     } else {
         DEBUG_PRINT_ERROR("get_parameter: OMX_IndexParamVideoProfileLevelQuerySupported Invalid codec");
         return OMX_ErrorInvalidComponent;
@@ -1202,10 +1029,21 @@ OMX_ERRORTYPE venc_dev::venc_get_supported_profile_level(OMX_VIDEO_PARAM_PROFILE
         }
     }
 
+    if (tier_cap.id) {
+        if(!venc_query_cap(tier_cap)) {
+            DEBUG_PRINT_ERROR("Getting capabilities for tier failed");
+            return OMX_ErrorHardware;
+        }
+    }
+
     /* Get the corresponding omx level from v4l2 level */
     if (!profile_level_converter::convert_v4l2_level_to_omx(m_sVenc_cfg.codectype, level_cap.maximum, (int *)&profileLevelType->eLevel)) {
         DEBUG_PRINT_ERROR("Invalid level, cannot find corresponding v4l2 level : %d ", level_cap.maximum);
         return OMX_ErrorHardware;
+    }
+    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC && tier_cap.maximum == V4L2_MPEG_VIDEO_HEVC_TIER_HIGH) {
+        /* handle HEVC high tier */
+        profileLevelType->eLevel <<= 1;
     }
 
     /* For given profile index get corresponding profile that needs to be supported */
@@ -1231,8 +1069,6 @@ OMX_ERRORTYPE venc_dev::venc_get_supported_profile_level(OMX_VIDEO_PARAM_PROFILE
                     (unsigned int)profileLevelType->nProfileIndex);
             return OMX_ErrorNoMore;
         }
-        /* Driver has no notion of VP8 profile and there is only one profile supported. Hence return here */
-        return OMX_ErrorNone;
     } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
         if (profileLevelType->nProfileIndex < (sizeof(hevc_profiles)/sizeof(int))) {
             profileLevelType->eProfile =  hevc_profiles[profileLevelType->nProfileIndex];
@@ -1255,6 +1091,27 @@ OMX_ERRORTYPE venc_dev::venc_get_supported_profile_level(OMX_VIDEO_PARAM_PROFILE
     if(!((profile_cap.flags >> v4l2_profile) & 0x1)) {
         DEBUG_PRINT_ERROR("%s: Invalid index corresponding profile not supported : %d ",__FUNCTION__, profileLevelType->eProfile);
         eRet = OMX_ErrorNoMore;
+    }
+
+    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
+        property_get("ro.board.platform", platform_name, "0");
+        if (!strncmp(platform_name, "lito", 4)) {
+            if (property_get("vendor.media.target.version", version, "0") && ((atoi(version) != 2) && (atoi(version) != 3))) {
+                DEBUG_PRINT_LOW("Disabling main10 and above for saipan");
+                m_disable_hdr = 0x2;
+            }
+        }
+    }
+
+    if (m_disable_hdr & ENC_HDR_DISABLE_FLAG) {
+        if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
+            if (profileLevelType->eProfile == OMX_VIDEO_HEVCProfileMain10 ||
+                profileLevelType->eProfile == OMX_VIDEO_HEVCProfileMain10HDR10 ||
+                profileLevelType->eProfile == OMX_VIDEO_HEVCProfileMain10HDR10Plus) {
+                DEBUG_PRINT_LOW("%s: HDR profile unsupported", __FUNCTION__);
+                return OMX_ErrorHardware;
+            }
+        }
     }
 
     DEBUG_PRINT_LOW("get_parameter: OMX_IndexParamVideoProfileLevelQuerySupported for Input port returned Profile:%u, Level:%u",
@@ -1305,38 +1162,45 @@ bool venc_dev::venc_get_supported_color_format(unsigned index, OMX_U32 *colorFor
 
 OMX_ERRORTYPE venc_dev::allocate_extradata(struct extradata_buffer_info *extradata_info, int flags)
 {
-    if (extradata_info->allocated) {
-        DEBUG_PRINT_HIGH("2nd allocation return for port = %d",extradata_info->port_index);
+    if (extradata_info->allocated)
         return OMX_ErrorNone;
+
+    if (!extradata_info->buffer_size || !extradata_info->count) {
+        DEBUG_PRINT_ERROR("Invalid extradata buffer size(%lu) or count(%d) for port %d",
+            extradata_info->buffer_size, extradata_info->count, extradata_info->port_index);
+        return OMX_ErrorUndefined;
     }
 
 #ifdef USE_ION
 
-    if (extradata_info->buffer_size) {
-        if (extradata_info->ion.data_fd != -1) {
-            venc_handle->ion_unmap(extradata_info->ion.data_fd, (void *)extradata_info->uaddr, extradata_info->size);
-            venc_handle->free_ion_memory(&extradata_info->ion);
+    for (int i = 0; i < extradata_info->count; i++) {
+        if (extradata_info->ion[i].data_fd != -1) {
+            venc_handle->ion_unmap(extradata_info->ion[i].data_fd,
+                    (void *)extradata_info->ion[i].uaddr, extradata_info->buffer_size);
+            venc_handle->free_ion_memory(&extradata_info->ion[i]);
         }
-        extradata_info->size = (extradata_info->size + 4095) & (~4095);
 
         // ION_IOC_MAP defined @ bionic/libc/kernel/uapi/linux/ion.h not in kernel,
         // and this ioctl uses "struct ion_fd_data" with handle member
         // Refer alloc_map_ion_memory definition @omx_video_base.cpp
         bool status = venc_handle->alloc_map_ion_memory(
-                extradata_info->size, &extradata_info->ion, flags);
+                extradata_info->buffer_size, &extradata_info->ion[i], flags);
 
         if (status == false) {
             DEBUG_PRINT_ERROR("Failed to alloc extradata memory\n");
             return OMX_ErrorInsufficientResources;
         }
 
-        extradata_info->uaddr = (char *)venc_handle->ion_map(extradata_info->ion.data_fd,
-                                                extradata_info->size);
+        extradata_info->ion[i].uaddr = (char *)venc_handle->ion_map(extradata_info->ion[i].data_fd,
+                                                extradata_info->buffer_size);
 
-        if (extradata_info->uaddr == MAP_FAILED) {
+        if (extradata_info->ion[i].uaddr == MAP_FAILED) {
             DEBUG_PRINT_ERROR("Failed to map extradata memory\n");
-            venc_handle->free_ion_memory(&extradata_info->ion);
+            venc_handle->free_ion_memory(&extradata_info->ion[i]);
             return OMX_ErrorInsufficientResources;
+        } else {
+            DEBUG_PRINT_HIGH("memset extradata buffer size %lu", extradata_info->buffer_size);
+            memset((char *)extradata_info->ion[i].uaddr, 0, extradata_info->buffer_size);
         }
     }
 #else
@@ -1354,14 +1218,17 @@ void venc_dev::free_extradata(struct extradata_buffer_info *extradata_info)
         return;
     }
 
-    if (extradata_info->uaddr) {
-        venc_handle->ion_unmap(extradata_info->ion.data_fd, (void *)extradata_info->uaddr, extradata_info->size);
-        extradata_info->uaddr = NULL;
-        venc_handle->free_ion_memory(&extradata_info->ion);
+    for (int i = 0; i < extradata_info->count; i++) {
+        if (extradata_info->ion[i].uaddr) {
+            venc_handle->ion_unmap(extradata_info->ion[i].data_fd,
+                    (void *)extradata_info->ion[i].uaddr, extradata_info->buffer_size);
+            extradata_info->ion[i].uaddr = NULL;
+            venc_handle->free_ion_memory(&extradata_info->ion[i]);
+        }
+        memset(&extradata_info->ion[i].alloc_data, 0, sizeof(struct ion_allocation_data));
     }
-
-    memset(extradata_info, 0, sizeof(*extradata_info));
-    extradata_info->ion.data_fd = -1;
+    extradata_info->buffer_size = 0;
+    extradata_info->count = 0;
     extradata_info->allocated = OMX_FALSE;
 #else
     (void)extradata_info;
@@ -1378,6 +1245,45 @@ bool venc_dev::venc_get_output_log_flag()
 {
     return (m_debug.out_buffer_log == 1);
 }
+
+int venc_dev::venc_cvp_log_buffers(const char *metadataName, uint32_t buffer_len, uint8_t *buf)
+{
+    if (!m_debug.cvpfile && m_debug.cvp_log) {
+        int size = 0;
+
+        if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264 ||
+            m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
+                size = snprintf(m_debug.cvpfile_name, PROPERTY_VALUE_MAX, "%s/enc_cvp_%lu_%lu_%p.bin",
+                        m_debug.log_loc, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height, this);
+        }
+
+        if ((size > PROPERTY_VALUE_MAX) && (size < 0)) {
+            DEBUG_PRINT_ERROR("Failed to open cvp file: %s for logging size:%d",
+                    m_debug.cvpfile_name, size);
+        }
+
+        m_debug.cvpfile = fopen(m_debug.cvpfile_name, "ab");
+        if (!m_debug.cvpfile) {
+            DEBUG_PRINT_ERROR("Failed to open cvp file: %s for logging errno:%d",
+                            m_debug.cvpfile_name, errno);
+            m_debug.cvpfile_name[0] = '\0';
+            return -1;
+        }
+    }
+
+    if (m_debug.cvpfile) {
+        // Truncate or Zero-filled to match the string size to 5
+        char name[6] = {0};
+        for(int i=0; i<5 && i<strlen(metadataName); i++) {
+            name[i] = metadataName[i];
+        }
+        fwrite(name, 5, 1, m_debug.cvpfile);                            // Metadata name
+        fwrite(&buffer_len, sizeof(buffer_len), 1, m_debug.cvpfile);    // Blob size
+        fwrite(buf, buffer_len, 1, m_debug.cvpfile);                    // Blob data
+    }
+    return 0;
+}
+
 
 int venc_dev::venc_output_log_buffers(const char *buffer_addr, int buffer_len, uint64_t timestamp)
 {
@@ -1397,10 +1303,8 @@ int venc_dev::venc_output_log_buffers(const char *buffer_addr, int buffer_len, u
         } else if(m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8) {
            size = snprintf(m_debug.outfile_name, PROPERTY_VALUE_MAX, "%s/output_enc_%lu_%lu_%p.ivf",
                            m_debug.log_loc, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height, this);
-        } else if(m_sVenc_cfg.codectype == V4L2_PIX_FMT_TME) {
-           size = snprintf(m_debug.outfile_name, PROPERTY_VALUE_MAX, "%s/output_enc_%lu_%lu_%p.tme",
-                           m_debug.log_loc, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height, this);
         }
+
         if ((size > PROPERTY_VALUE_MAX) && (size < 0)) {
              DEBUG_PRINT_ERROR("Failed to open output file: %s for logging size:%d",
                                 m_debug.outfile_name, size);
@@ -1430,28 +1334,24 @@ int venc_dev::venc_output_log_buffers(const char *buffer_addr, int buffer_len, u
     return 0;
 }
 
-int venc_dev::venc_extradata_log_buffers(char *buffer_addr, bool input)
+int venc_dev::venc_extradata_log_buffers(char *buffer_addr, int index, bool input)
 {
     int fd;
 
     if (input)
-        fd = input_extradata_info.ion.data_fd;
+        fd = input_extradata_info.ion[index].data_fd;
     else
-        fd = output_extradata_info.ion.data_fd;
+        fd = output_extradata_info.ion[index].data_fd;
 
     sync_start_read(fd);
     if (!m_debug.extradatafile && m_debug.extradata_log) {
         int size = 0;
 
-        if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) {
-           size = snprintf(m_debug.extradatafile_name, PROPERTY_VALUE_MAX, "%s/extradata_enc_%lu_%lu_%p.bin",
-                           m_debug.log_loc, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height, this);
-        } else if(m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
-           size = snprintf(m_debug.extradatafile_name, PROPERTY_VALUE_MAX, "%s/extradata_enc_%lu_%lu_%p.bin",
-                           m_debug.log_loc, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height, this);
-        } else if(m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8) {
-           size = snprintf(m_debug.extradatafile_name, PROPERTY_VALUE_MAX, "%s/extradata_enc_%lu_%lu_%p.bin",
-                           m_debug.log_loc, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height, this);
+        if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264 ||
+            m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC ||
+            m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8) {
+            size = snprintf(m_debug.extradatafile_name, PROPERTY_VALUE_MAX, "%s/extradata_enc_%lu_%lu_%p.bin",
+                            m_debug.log_loc, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height, this);
         }
         if ((size > PROPERTY_VALUE_MAX) && (size < 0)) {
              DEBUG_PRINT_ERROR("Failed to open extradata file: %s for logging size:%d",
@@ -1512,33 +1412,7 @@ int venc_dev::venc_input_log_buffers(OMX_BUFFERHEADERTYPE *pbuffer, int fd, int 
         unsigned char *pvirt = NULL, *ptemp = NULL;
         unsigned char *temp = (unsigned char *)pbuffer->pBuffer;
 
-        switch (inputformat) {
-            case V4L2_PIX_FMT_NV12:
-                color_format = COLOR_FMT_NV12;
-                break;
-            case V4L2_PIX_FMT_NV12_512:
-                color_format = COLOR_FMT_NV12_512;
-                break;
-            case V4L2_PIX_FMT_NV12_UBWC:
-                color_format = COLOR_FMT_NV12_UBWC;
-                break;
-            case V4L2_PIX_FMT_RGB32:
-                color_format = COLOR_FMT_RGBA8888;
-                break;
-            case V4L2_PIX_FMT_RGBA8888_UBWC:
-                color_format = COLOR_FMT_RGBA8888_UBWC;
-                break;
-            case V4L2_PIX_FMT_SDE_Y_CBCR_H2V2_P010_VENUS:
-                color_format = COLOR_FMT_P010;
-                break;
-            case V4L2_PIX_FMT_NV12_TP10_UBWC:
-                color_format = COLOR_FMT_NV12_BPP10_UBWC;
-                break;
-            default:
-                color_format = COLOR_FMT_NV12;
-                DEBUG_PRINT_LOW("Default format NV12 is set for logging [%lu]", inputformat);
-                break;
-        }
+        color_format = get_media_colorformat(inputformat);
 
         msize = VENUS_BUFFER_SIZE_USED(color_format, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height,interlaced);
         const unsigned int extra_size = VENUS_EXTRADATA_SIZE(m_sVenc_cfg.input_width, m_sVenc_cfg.input_height);
@@ -1637,27 +1511,7 @@ bool venc_dev::venc_open(OMX_U32 codec)
     FILE *soc_file = NULL;
     char buffer[10];
 
-    property_get("ro.board.platform", m_platform_name, "0");
-
-    if (!strncmp(m_platform_name, "msm8610", 7)) {
-        device_name = (OMX_STRING)"/dev/video/q6_enc";
-        supported_rc_modes = (RC_ALL & ~RC_CBR_CFR);
-    }
-
-    if (!strcmp(m_platform_name, "sm6150") || !strcmp(m_platform_name, "atoll") || !strcmp(m_platform_name, "trinket") || !strcmp(m_platform_name, "msmnile"))
-    {
-       hdr10metadata_supported = false;
-    }
-    else {
-       hdr10metadata_supported = true;
-    }
-
-#ifdef HYPERVISOR
-    m_nDriver_fd = hypv_open(device_name, O_RDWR);
-#else
-    m_nDriver_fd = open(device_name, O_RDWR);
-#endif
-
+    m_nDriver_fd = open (device_name, O_RDWR);
     if ((int)m_nDriver_fd < 0) {
         DEBUG_PRINT_ERROR("ERROR: Omx_venc::Comp Init Returning failure");
         return false;
@@ -1702,23 +1556,17 @@ bool venc_dev::venc_open(OMX_U32 codec)
         maxqp = 51;
         if (codec == OMX_VIDEO_CodingImageHEIC) {
             m_sVenc_cfg.input_width = DEFAULT_TILE_DIMENSION;
-            m_sVenc_cfg.input_height = DEFAULT_TILE_DIMENSION;
+            m_sVenc_cfg.input_height= DEFAULT_TILE_DIMENSION;
             m_sVenc_cfg.dvs_width = DEFAULT_TILE_DIMENSION;
             m_sVenc_cfg.dvs_height = DEFAULT_TILE_DIMENSION;
-            codec_profile.profile = V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN_STILL_PIC;
-        }
-        else
-            codec_profile.profile = V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN;
-        profile_level.level = V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_1;
-    } else if (codec == QOMX_VIDEO_CodingTME) {
-        m_sVenc_cfg.codectype = V4L2_PIX_FMT_TME;
+            codec_profile.profile = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE;
+        } else
+            codec_profile.profile = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN;
+        profile_level.level = V4L2_MPEG_VIDEO_HEVC_LEVEL_1;
     }
-    session_ipb_qp_values.min_i_qp = minqp;
-    session_ipb_qp_values.max_i_qp = maxqp;
-    session_ipb_qp_values.min_p_qp = minqp;
-    session_ipb_qp_values.max_p_qp = maxqp;
-    session_ipb_qp_values.min_b_qp = minqp;
-    session_ipb_qp_values.max_b_qp = maxqp;
+
+    session_ipb_qp_values.min_qp_packed = minqp | (minqp << 8) | (minqp << 16);
+    session_ipb_qp_values.max_qp_packed = maxqp | (maxqp << 8) | (maxqp << 16);
 
     int ret;
     ret = subscribe_to_events(m_nDriver_fd);
@@ -1762,6 +1610,17 @@ bool venc_dev::venc_open(OMX_U32 codec)
         fdesc.index++;
     }
 
+    if(venc_handle->is_secure_session()) {
+        control.id = V4L2_CID_MPEG_VIDC_VIDEO_SECURE;
+        control.value = 1;
+        DEBUG_PRINT_HIGH("ioctl: open secure device");
+        ret=ioctl(m_nDriver_fd, VIDIOC_S_CTRL,&control);
+        if (ret) {
+            DEBUG_PRINT_ERROR("ioctl: open secure dev fail, rc %d", ret);
+            return false;
+        }
+    }
+
     if (venc_handle->is_secure_session()) {
         m_sOutput_buff_property.alignment = SZ_1M;
         m_sInput_buff_property.alignment  = SZ_1M;
@@ -1769,6 +1628,23 @@ bool venc_dev::venc_open(OMX_U32 codec)
         m_sOutput_buff_property.alignment = SZ_4K;
         m_sInput_buff_property.alignment  = SZ_4K;
     }
+
+    if (m_codec == OMX_VIDEO_CodingImageHEIC) {
+        if (!venc_set_grid_enable()) {
+            DEBUG_PRINT_ERROR("Failed to enable grid");
+            return false;
+        }
+    }
+
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
+    fmt.fmt.pix_mp.width = m_sVenc_cfg.input_width;
+    fmt.fmt.pix_mp.pixelformat = V4L2_DEFAULT_OUTPUT_COLOR_FMT;
+    fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_470_SYSTEM_BG;
+
+    ret = ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt);
+    m_sInput_buff_property.datasize=fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -1787,28 +1663,6 @@ bool venc_dev::venc_open(OMX_U32 codec)
 
     m_sOutput_buff_property.datasize=fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
-    fmt.fmt.pix_mp.width = m_sVenc_cfg.input_width;
-    fmt.fmt.pix_mp.pixelformat = V4L2_DEFAULT_OUTPUT_COLOR_FMT;
-    fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_470_SYSTEM_BG;
-
-    ret = ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt);
-    m_sInput_buff_property.datasize=fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-
-    if (m_codec == OMX_VIDEO_CodingImageHEIC) {
-        if (!venc_set_grid_enable()) {
-            DEBUG_PRINT_ERROR("Failed to enable grid");
-            return false;
-        }
-
-        if (!venc_set_ratectrl_cfg(OMX_Video_ControlRateConstantQuality)) {
-            DEBUG_PRINT_ERROR("Failed to set rate control:CQ");
-            return false;
-        }
-    }
-
     bufreq.memory = V4L2_MEMORY_USERPTR;
     bufreq.count = 2;
 
@@ -1821,29 +1675,8 @@ bool venc_dev::venc_open(OMX_U32 codec)
     ret = ioctl(m_nDriver_fd,VIDIOC_REQBUFS, &bufreq);
     m_sOutput_buff_property.mincount = m_sOutput_buff_property.actualcount = bufreq.count;
 
-    if(venc_handle->is_secure_session()) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_SECURE;
-        control.value = 1;
-        DEBUG_PRINT_HIGH("ioctl: open secure device");
-        ret=ioctl(m_nDriver_fd, VIDIOC_S_CTRL,&control);
-        if (ret) {
-            DEBUG_PRINT_ERROR("ioctl: open secure dev fail, rc %d", ret);
-            return false;
-        }
-    }
-
     resume_in_stopped = 0;
     metadatamode = 0;
-
-    if (m_sVenc_cfg.codectype != V4L2_PIX_FMT_TME) {
-        control.id = V4L2_CID_MPEG_VIDEO_HEADER_MODE;
-        control.value = V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE;
-
-        DEBUG_PRINT_LOW("Calling IOCTL to disable seq_hdr in sync_frame id=%d, val=%d", control.id, control.value);
-
-        if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control))
-            DEBUG_PRINT_ERROR("Failed to set control");
-    }
 
     struct v4l2_frmsizeenum frmsize;
 
@@ -1867,10 +1700,18 @@ bool venc_dev::venc_open(OMX_U32 codec)
 
     //Initialize non-default parameters
     if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES;
+        control.id = V4L2_CID_MPEG_VIDEO_GOP_SIZE;
         control.value = 0x7fffffff;
         if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control))
             DEBUG_PRINT_ERROR("Failed to set V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAME\n");
+    }
+
+    //Disable auto blur by default
+    if (is_auto_blur_disabled) {
+        control.id = V4L2_CID_MPEG_VIDC_VIDEO_BLUR_DIMENSIONS;
+        control.value = 0x2;
+        if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control))
+           DEBUG_PRINT_ERROR("Failed to set V4L2_CID_MPEG_VIDC_VIDEO_BLUR_DIMENSIONS\n");
     }
 
 
@@ -1879,17 +1720,6 @@ bool venc_dev::venc_open(OMX_U32 codec)
     input_extradata_info.port_index = OUTPUT_PORT;
     output_extradata_info.port_index = CAPTURE_PORT;
 
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_TME) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_TME_PAYLOAD_VERSION;
-        ret = ioctl(m_nDriver_fd, VIDIOC_G_CTRL,&control);
-
-        if (ret) {
-            DEBUG_PRINT_ERROR("Failed to read TME version");
-            return false;
-        }
-        venc_handle->tme_payload_version = control.value;
-        DEBUG_PRINT_HIGH("TME version is 0x%x", control.value);
-    }
     return true;
 }
 
@@ -1944,17 +1774,9 @@ void venc_dev::venc_close()
         DEBUG_PRINT_HIGH("venc_close X");
         unsubscribe_to_events(m_nDriver_fd);
         close(m_poll_efd);
-#ifdef HYPERVISOR
-        hypv_close(m_nDriver_fd);
-#else
         close(m_nDriver_fd);
-#endif
         m_nDriver_fd = -1;
     }
-
-#ifdef _VQZIP_
-    vqzip.deinit();
-#endif
 
     if (m_debug.infile) {
         fclose(m_debug.infile);
@@ -1969,6 +1791,11 @@ void venc_dev::venc_close()
     if (m_debug.extradatafile) {
         fclose(m_debug.extradatafile);
         m_debug.extradatafile = NULL;
+    }
+
+    if (m_debug.cvpfile) {
+        fclose(m_debug.cvpfile);
+        m_debug.cvpfile = NULL;
     }
 }
 
@@ -2079,26 +1906,6 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
             return false;
         }
 
-        // Increase buffer-header count for metadata-mode on input port
-        // to improve buffering and reduce bottlenecks in clients
-        if (metadatamode) {
-            DEBUG_PRINT_LOW("FW returned buffer count = %d , overwriting with 9",
-                control.value);
-            minCount = 9;
-        }
-
-        if (m_sVenc_cfg.input_height * m_sVenc_cfg.input_width >= 3840*2160) {
-            DEBUG_PRINT_LOW("Increasing buffer count = %d to 11", minCount);
-            minCount = 11;
-        }
-
-        /* Need more buffers for HFR usecase */
-        if (operating_rate >= 120 || (m_sVenc_cfg.fps_num / m_sVenc_cfg.fps_den) >= 120) {
-            minCount = MAX(minCount, 16);
-            DEBUG_PRINT_HIGH("fps %d, operating rate %d, input min count %d",
-                   (int)(m_sVenc_cfg.fps_num / m_sVenc_cfg.fps_den), operating_rate, minCount);
-        }
-
         // Request MAX_V4L2_BUFS from V4L2 in batch mode.
         // Keep the original count for the client
         if (metadatamode && mBatchSize) {
@@ -2106,14 +1913,9 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
             DEBUG_PRINT_LOW("Set buffer count = %d as metadata mode and batchmode enabled", minCount);
         }
 
-        // reset min count to 4 for HEIC cases
-        if (mIsGridset) {
-            minCount = 4;
-            DEBUG_PRINT_LOW("Set buffer count = %d for HEIC", minCount);
-        }
-
         minCount = MAX((unsigned int)control.value, minCount);
         m_sInput_buff_property.mincount = minCount;
+        m_sInput_buff_property.actualcount = m_sInput_buff_property.mincount;
 
         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
@@ -2127,9 +1929,6 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
             return false;
         }
         m_sInput_buff_property.datasize=fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-
-        if (m_sInput_buff_property.actualcount < m_sInput_buff_property.mincount)
-            m_sInput_buff_property.actualcount = m_sInput_buff_property.mincount;
 
         *min_buff_count = m_sInput_buff_property.mincount;
         *actual_buff_count = m_sInput_buff_property.actualcount;
@@ -2150,8 +1949,7 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
             return false;
         }
         input_extradata_info.buffer_size =  ALIGN(extra_data_size, SZ_4K);
-        input_extradata_info.count = MAX_V4L2_BUFS;
-        input_extradata_info.size = input_extradata_info.buffer_size * input_extradata_info.count;
+        input_extradata_info.count = m_sInput_buff_property.actualcount;
         venc_handle->m_client_in_extradata_info.set_extradata_info(input_extradata_info.buffer_size,m_sInput_buff_property.actualcount);
     } else {
         unsigned int extra_idx = 0;
@@ -2202,17 +2000,8 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
             DEBUG_PRINT_LOW("set min count %d as mBatchSize %d", minCount, mBatchSize);
         }
 
-        /* Need more buffers for HFR usecase */
-        if (operating_rate >= 120 || (m_sVenc_cfg.fps_num / m_sVenc_cfg.fps_den) >= 120) {
-            minCount = MAX(minCount, 16);
-            DEBUG_PRINT_HIGH("fps %d, operating rate %d, output min count %d",
-                   (int)(m_sVenc_cfg.fps_num / m_sVenc_cfg.fps_den), operating_rate, minCount);
-        }
-
         m_sOutput_buff_property.mincount = minCount;
-
-        if (m_sOutput_buff_property.actualcount < m_sOutput_buff_property.mincount)
-            m_sOutput_buff_property.actualcount = m_sOutput_buff_property.mincount;
+        m_sOutput_buff_property.actualcount = m_sOutput_buff_property.mincount;
 
         *min_buff_count = m_sOutput_buff_property.mincount;
         *actual_buff_count = m_sOutput_buff_property.actualcount;
@@ -2229,7 +2018,6 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
 
         output_extradata_info.buffer_size = ALIGN(extra_data_size, SZ_4K);
         output_extradata_info.count = m_sOutput_buff_property.actualcount;
-        output_extradata_info.size = output_extradata_info.buffer_size * output_extradata_info.count;
         venc_handle->m_client_out_extradata_info.set_extradata_info(output_extradata_info.buffer_size,output_extradata_info.count);
     }
 
@@ -2237,1247 +2025,6 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
         "updated min count %d, act count %d, size %d, num planes %d",
         port, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height, fmt.fmt.pix_mp.pixelformat,
         control.value, *min_buff_count, *actual_buff_count, *buff_size, fmt.fmt.pix_mp.num_planes);
-
-    return true;
-}
-
-bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
-{
-    DEBUG_PRINT_LOW("venc_set_param index 0x%x", index);
-    struct v4l2_format fmt;
-    struct v4l2_requestbuffers bufreq;
-    int ret;
-    bool isCBR;
-
-    switch ((int)index) {
-        case OMX_IndexParamPortDefinition:
-            {
-                OMX_PARAM_PORTDEFINITIONTYPE *portDefn;
-                portDefn = (OMX_PARAM_PORTDEFINITIONTYPE *) paramData;
-
-                if (portDefn->nPortIndex == PORT_INDEX_IN) {
-                    if (!venc_set_encode_framerate(portDefn->format.video.xFramerate)) {
-                        return false;
-                    }
-
-                    if (enable_mv_narrow_searchrange &&
-                        (m_sVenc_cfg.input_width * m_sVenc_cfg.input_height) >=
-                        (OMX_CORE_1080P_WIDTH * OMX_CORE_1080P_HEIGHT)) {
-                        if (venc_set_searchrange() == false) {
-                            DEBUG_PRINT_ERROR("ERROR: Failed to set search range");
-                        }
-                    }
-
-                    unsigned long inputformat = venc_get_color_format(portDefn->format.video.eColorFormat);
-
-                    if (m_sVenc_cfg.input_height != portDefn->format.video.nFrameHeight ||
-                            m_sVenc_cfg.input_width != portDefn->format.video.nFrameWidth ||
-                            m_sInput_buff_property.actualcount != portDefn->nBufferCountActual ||
-                            m_sVenc_cfg.inputformat != inputformat) {
-
-                        DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamPortDefinition: port: %u, WxH %lux%lu --> %ux%u, count %lu --> %u, format %#lx --> %#lx",
-                            portDefn->nPortIndex, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height,
-                            portDefn->format.video.nFrameWidth, portDefn->format.video.nFrameHeight,
-                            m_sInput_buff_property.actualcount, portDefn->nBufferCountActual,
-                            m_sVenc_cfg.inputformat, inputformat);
-
-                        if (portDefn->nBufferCountActual < m_sInput_buff_property.mincount) {
-                            DEBUG_PRINT_LOW("Actual count %u is less than driver mincount %lu on port %u",
-                                portDefn->nBufferCountActual, m_sInput_buff_property.mincount, portDefn->nPortIndex);
-                            return false;
-                        }
-
-                        m_sVenc_cfg.input_height = portDefn->format.video.nFrameHeight;
-                        m_sVenc_cfg.input_width = portDefn->format.video.nFrameWidth;
-                        m_sVenc_cfg.inputformat = inputformat;
-                        m_sInput_buff_property.actualcount = portDefn->nBufferCountActual;
-
-                        memset(&fmt, 0, sizeof(fmt));
-                        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-                        fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
-                        fmt.fmt.pix_mp.width = m_sVenc_cfg.input_width;
-                        fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.inputformat;
-                        fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_470_SYSTEM_BG;
-                        if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
-                            DEBUG_PRINT_ERROR("set format failed, type %d, wxh %dx%d, pixelformat %#x, colorspace %#x",
-                                 fmt.type, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
-                                 fmt.fmt.pix_mp.pixelformat, fmt.fmt.pix_mp.colorspace);
-                            hw_overload = errno == EBUSY;
-                            return false;
-                        }
-                        m_sInput_buff_property.datasize=fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-
-                        bufreq.memory = V4L2_MEMORY_USERPTR;
-                        bufreq.count = portDefn->nBufferCountActual;
-                        bufreq.type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-                        if (ioctl(m_nDriver_fd,VIDIOC_REQBUFS, &bufreq)) {
-                            DEBUG_PRINT_ERROR("reqbufs failed, type %d, count %d", bufreq.type, bufreq.count);
-                            return false;
-                        }
-
-                        if (num_input_planes > 1)
-                            input_extradata_info.count = m_sInput_buff_property.actualcount + 1;
-
-                        if (!downscalar_enabled) {
-                            m_sVenc_cfg.dvs_height = portDefn->format.video.nFrameHeight;
-                            m_sVenc_cfg.dvs_width = portDefn->format.video.nFrameWidth;
-                        }
-                        memset(&fmt, 0, sizeof(fmt));
-                        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                        fmt.fmt.pix_mp.height = m_sVenc_cfg.dvs_height;
-                        fmt.fmt.pix_mp.width = m_sVenc_cfg.dvs_width;
-                        fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.codectype;
-
-                        if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
-                            DEBUG_PRINT_ERROR("VIDIOC_S_FMT CAPTURE_MPLANE Failed");
-                            hw_overload = errno == EBUSY;
-                            return false;
-                        }
-
-                        m_sOutput_buff_property.datasize = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-
-                    } else {
-                        DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamPortDefinition: parameters not changed on port %d",
-                            portDefn->nPortIndex);
-                    }
-                } else if (portDefn->nPortIndex == PORT_INDEX_OUT) {
-
-                    unsigned long codectype = venc_get_codectype(portDefn->format.video.eCompressionFormat);
-
-                    //Don't worry about width/height if downscalar is enabled.
-                    if (((m_sVenc_cfg.dvs_height != portDefn->format.video.nFrameHeight ||
-                            m_sVenc_cfg.dvs_width != portDefn->format.video.nFrameWidth) && !downscalar_enabled) ||
-                            m_sOutput_buff_property.actualcount != portDefn->nBufferCountActual ||
-                            m_sVenc_cfg.codectype != codectype) {
-
-                        if (portDefn->nBufferCountActual < m_sOutput_buff_property.mincount) {
-                            DEBUG_PRINT_LOW("Actual count %u is less than driver mincount %lu on port %u",
-                                portDefn->nBufferCountActual, m_sOutput_buff_property.mincount, portDefn->nPortIndex);
-                            return false;
-                        }
-
-                        //If downscalar is enabled. Correct width/height is populated no need to replace with port def width/height
-                        if (!downscalar_enabled) {
-                            DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamPortDefinition: port: %u, WxH %lux%lu --> %ux%u, count %lu --> %u, format %#lx --> %#lx",
-                                            portDefn->nPortIndex, m_sVenc_cfg.dvs_width, m_sVenc_cfg.dvs_height,
-                                            portDefn->format.video.nFrameWidth, portDefn->format.video.nFrameHeight,
-                                            m_sOutput_buff_property.actualcount, portDefn->nBufferCountActual,
-                                            m_sVenc_cfg.codectype, codectype);
-                            m_sVenc_cfg.dvs_height = portDefn->format.video.nFrameHeight;
-                            m_sVenc_cfg.dvs_width = portDefn->format.video.nFrameWidth;
-                        }
-
-                        m_sVenc_cfg.codectype = codectype;
-                        m_sOutput_buff_property.actualcount = portDefn->nBufferCountActual;
-
-                        memset(&fmt, 0, sizeof(fmt));
-                        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                        fmt.fmt.pix_mp.height = m_sVenc_cfg.dvs_height;
-                        fmt.fmt.pix_mp.width = m_sVenc_cfg.dvs_width;
-                        fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.codectype;
-                        if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
-                            DEBUG_PRINT_ERROR("set format failed, type %d, wxh %dx%d, pixelformat %#x",
-                                 fmt.type, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
-                                 fmt.fmt.pix_mp.pixelformat);
-                            hw_overload = errno == EBUSY;
-                            return false;
-                        }
-                        m_sOutput_buff_property.datasize = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-
-                        if (m_sVenc_cfg.codectype != V4L2_PIX_FMT_TME) {
-                            if (!venc_set_target_bitrate(portDefn->format.video.nBitrate)) {
-                                return false;
-                            }
-                        }
-
-                        bufreq.memory = V4L2_MEMORY_USERPTR;
-                        bufreq.count = portDefn->nBufferCountActual;
-                        bufreq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                        if (ioctl(m_nDriver_fd,VIDIOC_REQBUFS, &bufreq)) {
-                            DEBUG_PRINT_ERROR("reqbufs failed, type %d, count %d", bufreq.type, bufreq.count);
-                            return false;
-                        }
-
-                        if (num_output_planes > 1)
-                            output_extradata_info.count = m_sOutput_buff_property.actualcount;
-                    } else {
-                        DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamPortDefinition: parameters not changed on port %d",
-                            portDefn->nPortIndex);
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index (%d) for OMX_IndexParamPortDefinition", portDefn->nPortIndex);
-                }
-            }
-            break;
-        case OMX_IndexParamVideoPortFormat:
-            {
-                OMX_VIDEO_PARAM_PORTFORMATTYPE *portFmt;
-                portFmt =(OMX_VIDEO_PARAM_PORTFORMATTYPE *)paramData;
-                DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamVideoPortFormat");
-
-                if (portFmt->nPortIndex == (OMX_U32) PORT_INDEX_IN) {
-                    if (!venc_set_color_format(portFmt->eColorFormat)) {
-                        return false;
-                    }
-                } else if (portFmt->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (!venc_set_encode_framerate(portFmt->xFramerate)) {
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoPortFormat");
-                }
-                    break;
-            }
-        case OMX_IndexParamVideoBitrate:
-            {
-                OMX_VIDEO_PARAM_BITRATETYPE* pParam;
-                pParam = (OMX_VIDEO_PARAM_BITRATETYPE*)paramData;
-                DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamVideoBitrate");
-
-                if (pParam->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (!venc_set_ratectrl_cfg(pParam->eControlRate)) {
-                        DEBUG_PRINT_ERROR("ERROR: Rate Control setting failed");
-                        return false;
-                    }
-
-                    if (!venc_set_target_bitrate(pParam->nTargetBitrate)) {
-                        DEBUG_PRINT_ERROR("ERROR: Target Bit Rate setting failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoBitrate");
-                }
-
-                break;
-            }
-        case OMX_IndexParamVideoAvc:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoAvc");
-                OMX_VIDEO_PARAM_AVCTYPE* pParam = (OMX_VIDEO_PARAM_AVCTYPE*)paramData;
-                OMX_U32 bFrames = 0;
-
-                if (pParam->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    DEBUG_PRINT_LOW("pParam->eProfile :%d ,pParam->eLevel %d",
-                            pParam->eProfile,pParam->eLevel);
-
-                    if (!venc_set_profile (pParam->eProfile)) {
-                        DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating Profile %d",
-                                pParam->eProfile);
-                        return false;
-                    } else {
-                        if ((pParam->eProfile != OMX_VIDEO_AVCProfileBaseline) &&
-                            (pParam->eProfile != (OMX_VIDEO_AVCPROFILETYPE) QOMX_VIDEO_AVCProfileConstrainedBaseline)) {
-                            if (pParam->nBFrames) {
-                                bFrames = pParam->nBFrames;
-                            }
-                        } else {
-                            if (pParam->nBFrames) {
-                                DEBUG_PRINT_ERROR("Warning: B frames not supported");
-                                bFrames = 0;
-                            }
-                        }
-                    }
-
-                    if(!venc_set_level(pParam->eLevel)) {
-                        DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating level to unknown");
-                        return false;
-                    }
-
-                    if (!venc_set_intra_period (pParam->nPFrames, bFrames)) {
-                        DEBUG_PRINT_ERROR("ERROR: Request for setting intra period failed");
-                        return false;
-                    }
-                    if (!venc_set_entropy_config (pParam->bEntropyCodingCABAC, pParam->nCabacInitIdc)) {
-                        DEBUG_PRINT_ERROR("ERROR: Request for setting Entropy failed");
-                        return false;
-                    }
-                    if (!venc_set_inloop_filter (pParam->eLoopFilterMode)) {
-                        DEBUG_PRINT_ERROR("ERROR: Request for setting Inloop filter failed");
-                        return false;
-                    }
-
-                    if (!venc_set_multislice_cfg(V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_MB, pParam->nSliceHeaderSpacing)) {
-                        DEBUG_PRINT_ERROR("WARNING: Unsuccessful in updating slice_config");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoAvc");
-                }
-
-                //TBD, lot of other variables to be updated, yet to decide
-                break;
-            }
-        case (OMX_INDEXTYPE)OMX_IndexParamVideoVp8:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoVp8");
-                OMX_VIDEO_PARAM_VP8TYPE* pParam = (OMX_VIDEO_PARAM_VP8TYPE*)paramData;
-
-                //TODO: Set VP8 level/profile currently based on driver change
-                if (!venc_set_profile (pParam->eProfile)) {
-                    DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating Profile %d",
-                            pParam->eProfile);
-                    return false;
-                }
-                if (!venc_set_level (OMX_VIDEO_LEVEL_UNKNOWN)) {
-                    DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating level to unknown");
-                    return false;
-                }
-                if(venc_set_vpx_error_resilience(pParam->bErrorResilientMode) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Failed to set vpx error resilience");
-                    return false;
-                }
-                break;
-            }
-            case (OMX_INDEXTYPE)OMX_IndexParamVideoHevc:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoHevc");
-                OMX_VIDEO_PARAM_HEVCTYPE* pParam = (OMX_VIDEO_PARAM_HEVCTYPE*)paramData;
-
-                if (!venc_set_profile (pParam->eProfile)) {
-                    DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating Profile %d",
-                                        pParam->eProfile);
-                    return false;
-                }
-                if (!venc_set_level (OMX_VIDEO_LEVEL_UNKNOWN)) {
-                    DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating level to unknown");
-                    return false;
-                }
-                if (!venc_set_inloop_filter(OMX_VIDEO_AVCLoopFilterEnable))
-                    DEBUG_PRINT_HIGH("WARN: Request for setting Inloop filter failed for HEVC encoder");
-
-                OMX_U32 fps = m_sVenc_cfg.fps_den ? m_sVenc_cfg.fps_num / m_sVenc_cfg.fps_den : 30;
-                OMX_U32 nPFrames = pParam->nKeyFrameInterval > 0 ? pParam->nKeyFrameInterval - 1 : fps - 1;
-                if (!venc_set_intra_period (nPFrames, 0 /* nBFrames */)) {
-                    DEBUG_PRINT_ERROR("ERROR: Request for setting intra period failed");
-                    return false;
-                }
-                break;
-            }
-            case (OMX_INDEXTYPE)OMX_IndexParamVideoTme:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoTme");
-                QOMX_VIDEO_PARAM_TMETYPE * pParam = (QOMX_VIDEO_PARAM_TMETYPE*)paramData;
-
-                if (!venc_set_profile(pParam->eProfile)) {
-                    DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating Profile %d",
-                                        pParam->eProfile);
-                    return false;
-                }
-                if (!venc_set_level(pParam->eLevel)) {
-                    DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating level %d",
-                                      pParam->eLevel);
-                    return false;
-                }
-                break;
-            }
-        case (OMX_INDEXTYPE)OMX_IndexParamVideoAndroidImageGrid:
-            {
-                DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamVideoAndroidImageGrid. Ignore!");
-                break;
-            }
-        case OMX_IndexParamVideoIntraRefresh:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoIntraRefresh");
-                OMX_VIDEO_PARAM_INTRAREFRESHTYPE *intra_refresh_param =
-                    (OMX_VIDEO_PARAM_INTRAREFRESHTYPE *)paramData;
-
-                if (intra_refresh_param->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    intra_refresh.irmode     = intra_refresh_param->eRefreshMode;
-                    intra_refresh.mbcount    = intra_refresh_param->nCirMBs;
-                    intra_refresh.framecount = 0;
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoIntraRefresh");
-                }
-
-                break;
-            }
-        case OMX_IndexParamVideoAndroidVp8Encoder:
-            {
-                DEBUG_PRINT_LOW("venc_set_param: OMX_IndexParamVideoAndroidVp8Encoder");
-                OMX_VIDEO_PARAM_ANDROID_VP8ENCODERTYPE *vp8EncodeParams =
-                    (OMX_VIDEO_PARAM_ANDROID_VP8ENCODERTYPE *)paramData;
-
-                if (vp8EncodeParams->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                     int pFrames = vp8EncodeParams->nKeyFrameInterval - 1;
-                     if (venc_set_intra_period(pFrames, 0) == false) {
-                         DEBUG_PRINT_ERROR("ERROR: Request for setting intra period failed");
-                         return false;
-                     }
-
-                 } else {
-                     DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoAndroidVp8Encoder");
-                 }
-                 break;
-            }
-        case OMX_IndexParamVideoErrorCorrection:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoErrorCorrection");
-                OMX_VIDEO_PARAM_ERRORCORRECTIONTYPE *error_resilience =
-                    (OMX_VIDEO_PARAM_ERRORCORRECTIONTYPE *)paramData;
-
-                if (error_resilience->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (venc_set_error_resilience(error_resilience) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting Error Correction failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoErrorCorrection");
-                }
-
-                break;
-            }
-         case OMX_QcomIndexParamVideoSliceSpacing:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_QcomIndexParamVideoSliceSpacing");
-                QOMX_VIDEO_PARAM_SLICE_SPACING_TYPE *slice_spacing =
-                    (QOMX_VIDEO_PARAM_SLICE_SPACING_TYPE*)paramData;
-
-                if (slice_spacing->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (!venc_set_multislice_cfg(slice_spacing->eSliceMode, slice_spacing->nSliceSize)) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting Slice Spacing failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_QcomIndexParamVideoSliceSpacing");
-                }
-
-                break;
-            }
-        case OMX_IndexParamVideoProfileLevelCurrent:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoProfileLevelCurrent");
-                OMX_VIDEO_PARAM_PROFILELEVELTYPE *profile_level =
-                    (OMX_VIDEO_PARAM_PROFILELEVELTYPE *)paramData;
-
-                if (profile_level->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (!venc_set_profile(profile_level->eProfile)) {
-                        DEBUG_PRINT_ERROR("WARNING: Unsuccessful in updating Profile");
-                        return false;
-                    }
-                    if (!venc_set_level(profile_level->eLevel)) {
-                        DEBUG_PRINT_ERROR("WARNING: Unsuccessful in updating level");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoProfileLevelCurrent");
-                }
-
-                break;
-            }
-        case OMX_IndexParamVideoQuantization:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_IndexParamVideoQuantization");
-                OMX_VIDEO_PARAM_QUANTIZATIONTYPE *session_qp =
-                    (OMX_VIDEO_PARAM_QUANTIZATIONTYPE *)paramData;
-                if (session_qp->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (venc_set_qp(session_qp->nQpI,
-                                session_qp->nQpP,
-                                session_qp->nQpB,
-                                ENABLE_I_QP | ENABLE_P_QP | ENABLE_B_QP) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting Session QP failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexParamVideoQuantization");
-                }
-
-                break;
-            }
-        case QOMX_IndexParamVideoInitialQp:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:QOMX_IndexParamVideoInitialQp");
-                QOMX_EXTNINDEX_VIDEO_INITIALQP *initial_qp =
-                    (QOMX_EXTNINDEX_VIDEO_INITIALQP *)paramData;
-                if (initial_qp->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (venc_set_qp(initial_qp->nQpI,
-                                initial_qp->nQpP,
-                                initial_qp->nQpB,
-                                initial_qp->bEnableInitQp) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting Initial QP failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for QOMX_IndexParamVideoInitialQp");
-                }
-
-                break;
-            }
-        case OMX_QcomIndexParamVideoIPBQPRange:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:OMX_QcomIndexParamVideoIPBQPRange");
-                OMX_QCOM_VIDEO_PARAM_IPB_QPRANGETYPE *session_qp_range =
-                    (OMX_QCOM_VIDEO_PARAM_IPB_QPRANGETYPE *)paramData;
-                if(session_qp_range->nPortIndex == (OMX_U32)PORT_INDEX_OUT) {
-                    if ( venc_set_session_qp_range (session_qp_range) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting QP range failed");
-                        return false;
-                    }
-                }
-
-                break;
-            }
-        case OMX_QcomIndexEnableSliceDeliveryMode:
-            {
-                QOMX_EXTNINDEX_PARAMTYPE* pParam =
-                    (QOMX_EXTNINDEX_PARAMTYPE*)paramData;
-
-                if (pParam->nPortIndex == PORT_INDEX_OUT) {
-                    if (venc_set_slice_delivery_mode(pParam->bEnable) == false) {
-                        DEBUG_PRINT_ERROR("Setting slice delivery mode failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("OMX_QcomIndexEnableSliceDeliveryMode "
-                            "called on wrong port(%u)", (unsigned int)pParam->nPortIndex);
-                    return false;
-                }
-
-                break;
-            }
-        case OMX_ExtraDataFrameDimension:
-            {
-                DEBUG_PRINT_LOW("venc_set_param: OMX_ExtraDataFrameDimension");
-                OMX_BOOL extra_data = *(OMX_BOOL *)(paramData);
-
-                if (venc_set_extradata(OMX_ExtraDataFrameDimension, extra_data) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_ExtraDataFrameDimension failed");
-                    return false;
-                }
-
-                extradata = true;
-                break;
-            }
-        case OMX_ExtraDataVideoEncoderSliceInfo:
-            {
-                DEBUG_PRINT_LOW("venc_set_param: OMX_ExtraDataVideoEncoderSliceInfo");
-                OMX_BOOL extra_data = *(OMX_BOOL *)(paramData);
-
-                if (venc_set_extradata(OMX_ExtraDataVideoEncoderSliceInfo, extra_data) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_ExtraDataVideoEncoderSliceInfo failed");
-                    return false;
-                }
-
-                extradata = true;
-                break;
-            }
-        case OMX_ExtraDataVideoEncoderMBInfo:
-            {
-                DEBUG_PRINT_LOW("venc_set_param: OMX_ExtraDataVideoEncoderMBInfo");
-                OMX_BOOL extra_data =  *(OMX_BOOL *)(paramData);
-
-                if (venc_set_extradata(OMX_ExtraDataVideoEncoderMBInfo, extra_data) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_ExtraDataVideoEncoderMBInfo failed");
-                    return false;
-                }
-
-                extradata = true;
-                break;
-            }
-        case OMX_ExtraDataVideoLTRInfo:
-            {
-                DEBUG_PRINT_LOW("venc_set_param: OMX_ExtraDataVideoLTRInfo");
-                OMX_BOOL extra_data =  *(OMX_BOOL *)(paramData);
-                if (venc_set_extradata(OMX_ExtraDataVideoLTRInfo, extra_data) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_ExtraDataVideoLTRInfo failed");
-                    return false;
-                }
-                extradata = true;
-                break;
-            }
-        case OMX_QcomIndexParamSequenceHeaderWithIDR:
-            {
-                PrependSPSPPSToIDRFramesParams * pParam =
-                    (PrependSPSPPSToIDRFramesParams *)paramData;
-
-                DEBUG_PRINT_LOW("set inband sps/pps: %d", pParam->bEnable);
-                if(venc_set_inband_video_header(pParam->bEnable) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: set inband sps/pps failed");
-                    return false;
-                }
-
-                break;
-            }
-        case OMX_QcomIndexParamAUDelimiter:
-            {
-                OMX_QCOM_VIDEO_CONFIG_AUD * pParam =
-                    (OMX_QCOM_VIDEO_CONFIG_AUD *)paramData;
-
-                DEBUG_PRINT_LOW("set AU Delimiters: %d", pParam->bEnable);
-                if(venc_set_au_delimiter(pParam->bEnable) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: set AU delimiter failed");
-                    return false;
-                }
-
-                break;
-            }
-        case OMX_QcomIndexConfigH264EntropyCodingCabac:
-            {
-                QOMX_VIDEO_H264ENTROPYCODINGTYPE * pParam =
-                    (QOMX_VIDEO_H264ENTROPYCODINGTYPE *)paramData;
-
-                DEBUG_PRINT_LOW("set Entropy info : %d", pParam->bCabac);
-                if(venc_set_entropy_config (pParam->bCabac, 0) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: set Entropy failed");
-                    return false;
-                }
-
-                break;
-            }
-        case OMX_QcomIndexParamH264VUITimingInfo:
-            {
-                OMX_QCOM_VIDEO_PARAM_VUI_TIMING_INFO *pParam =
-                        (OMX_QCOM_VIDEO_PARAM_VUI_TIMING_INFO *)paramData;
-                DEBUG_PRINT_LOW("Set VUI timing info: %d", pParam->bEnable);
-                if(venc_set_vui_timing_info(pParam->bEnable) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Failed to set vui timing info to %d", pParam->bEnable);
-                    return false;
-                } else {
-                    vui_timing_info.enabled = (unsigned int) pParam->bEnable;
-                }
-                break;
-            }
-        case OMX_QcomIndexParamPeakBitrate:
-            {
-                OMX_QCOM_VIDEO_PARAM_PEAK_BITRATE *pParam =
-                        (OMX_QCOM_VIDEO_PARAM_PEAK_BITRATE *)paramData;
-                DEBUG_PRINT_LOW("Set peak bitrate: %u", (unsigned int)pParam->nPeakBitrate);
-                if(venc_set_peak_bitrate(pParam->nPeakBitrate) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Failed to set peak bitrate to %u", (unsigned int)pParam->nPeakBitrate);
-                    return false;
-                } else {
-                    peak_bitrate.peakbitrate = (unsigned int) pParam->nPeakBitrate;
-                }
-                break;
-            }
-       case OMX_QcomIndexParamSetMVSearchrange:
-            {
-               DEBUG_PRINT_LOW("venc_set_config: OMX_QcomIndexParamSetMVSearchrange");
-               is_searchrange_set = true;
-               if (!venc_set_searchrange()) {
-                   DEBUG_PRINT_ERROR("ERROR: Failed to set search range");
-                   return false;
-               }
-            }
-            break;
-        case OMX_QcomIndexParamVideoLTRCount:
-            {
-                DEBUG_PRINT_LOW("venc_set_param: OMX_QcomIndexParamVideoLTRCount");
-                OMX_QCOM_VIDEO_PARAM_LTRCOUNT_TYPE* pParam =
-                        (OMX_QCOM_VIDEO_PARAM_LTRCOUNT_TYPE*)paramData;
-                if (pParam->nCount > 0) {
-                    if (venc_set_ltrmode(1, pParam->nCount) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Enable LTR mode failed");
-                        return false;
-                    }
-                } else {
-                    if (venc_set_ltrmode(0, 0) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Disable LTR mode failed");
-                        return false;
-                    }
-                }
-                break;
-            }
-        case OMX_QcomIndexParamBatchSize:
-            {
-                OMX_PARAM_U32TYPE* pParam =
-                    (OMX_PARAM_U32TYPE*)paramData;
-
-                if (pParam->nPortIndex == PORT_INDEX_OUT) {
-                    DEBUG_PRINT_ERROR("For the moment, client-driven batching not supported"
-                            " on output port");
-                    return false;
-                }
-                break;
-            }
-        case OMX_QcomIndexParamVencAspectRatio:
-            {
-                if (!venc_set_aspectratio(paramData)) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_QcomIndexParamVencAspectRatio failed");
-                    return false;
-                }
-                break;
-            }
-        case OMX_QTIIndexParamVideoEnableRoiInfo:
-            {
-                struct v4l2_control control;
-                OMX_BOOL extra_data =  *(OMX_BOOL *)(paramData);
-                if (extra_data == OMX_FALSE) {
-                    DEBUG_PRINT_INFO("OMX_QTIIndexParamVideoEnableRoiInfo: bEnableRoiInfo is false");
-                    break;
-                }
-                if (m_sVenc_cfg.codectype != V4L2_PIX_FMT_H264 &&
-                        m_sVenc_cfg.codectype != V4L2_PIX_FMT_HEVC) {
-                    DEBUG_PRINT_ERROR("OMX_QTIIndexParamVideoEnableRoiInfo is not supported for %lu codec", m_sVenc_cfg.codectype);
-                    return false;
-                }
-                control.id = V4L2_CID_MPEG_VIDC_VIDEO_EXTRADATA;
-                control.value = V4L2_MPEG_VIDC_EXTRADATA_ROI_QP;
-                DEBUG_PRINT_LOW("Setting param OMX_QTIIndexParamVideoEnableRoiInfo");
-                if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_QTIIndexParamVideoEnableRoiInfo failed");
-                    return false;
-                }
-                m_roi_enabled = true;
-                control.id = V4L2_CID_MPEG_VIDC_VIDEO_ROI_TYPE;
-                if (ioctl(m_nDriver_fd, VIDIOC_G_CTRL, &control)) {
-                    DEBUG_PRINT_ERROR("ERROR: Getting V4L2_CID_MPEG_VIDC_VIDEO_ROI_TYPE failed");
-                } else {
-                    DEBUG_PRINT_LOW("ROI type: %d", control.value);
-                    m_roi_type = control.value;
-                }
-                break;
-            }
-        case OMX_QTIIndexParamLowLatencyMode:
-            {
-                QOMX_EXTNINDEX_VIDEO_LOW_LATENCY_MODE *pParam =
-                    (QOMX_EXTNINDEX_VIDEO_LOW_LATENCY_MODE*)paramData;
-
-                if (!venc_set_lowlatency_mode(pParam->bEnableLowLatencyMode)) {
-                     DEBUG_PRINT_ERROR("Setting low latency mode failed");
-                     return false;
-                }
-                break;
-            }
-        case OMX_IndexParamAndroidVideoTemporalLayering:
-            {
-                OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE hierData;
-                memcpy(&hierData, paramData, sizeof(hierData));
-
-                if (!venc_validate_temporal_extn(hierData)) {
-                    DEBUG_PRINT_ERROR("set_param: Failed to validate temporal settings");
-                    return false;
-                }
-
-                venc_copy_temporal_settings(hierData);
-
-                break;
-            }
-        case OMX_QTIIndexParamDisablePQ:
-            {
-                QOMX_DISABLETYPE * pParam = (QOMX_DISABLETYPE *)paramData;
-                DEBUG_PRINT_LOW("venc_set_param: OMX_QTIIndexParamDisablePQ: %d", pParam->bDisable);
-                break;
-            }
-        case OMX_QTIIndexParamIframeSizeType:
-            {
-                QOMX_VIDEO_IFRAMESIZE* pParam =
-                    (QOMX_VIDEO_IFRAMESIZE *)paramData;
-                isCBR = rate_ctrl.rcmode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR_VFR ||
-                        rate_ctrl.rcmode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
-                if (!isCBR) {
-                    DEBUG_PRINT_ERROR("venc_set_param: OMX_QTIIndexParamIframeSizeType not allowed for this configuration isCBR(%d)",
-                        isCBR);
-                    return false;
-                }
-                if (!venc_set_iframesize_type(pParam->eType)) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_QTIIndexParamIframeSizeType failed");
-                    return false;
-                }
-                break;
-            }
-        case OMX_QTIIndexParamEnableAVTimerTimestamps:
-            {
-                QOMX_ENABLETYPE *pParam = (QOMX_ENABLETYPE *)paramData;
-                mUseAVTimerTimestamps = pParam->bEnable == OMX_TRUE;
-                DEBUG_PRINT_INFO("AVTimer timestamps enabled");
-                break;
-            }
-        case OMX_QcomIndexParamVideoDownScalar:
-            {
-                QOMX_INDEXDOWNSCALAR *pParam = (QOMX_INDEXDOWNSCALAR *)paramData;
-                downscalar_enabled = pParam->bEnable;
-
-                DEBUG_PRINT_INFO("Downscalar settings: Enabled : %d Width : %u Height %u",
-                    pParam->bEnable, pParam->nOutputWidth, pParam->nOutputHeight);
-                if (downscalar_enabled) {
-                    m_sVenc_cfg.dvs_width = pParam->nOutputWidth;
-                    m_sVenc_cfg.dvs_height = pParam->nOutputHeight;
-
-                    memset(&fmt, 0, sizeof(fmt));
-                    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                    fmt.fmt.pix_mp.width = pParam->nOutputWidth;
-                    fmt.fmt.pix_mp.height = pParam->nOutputHeight;
-                    fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.codectype;
-                    if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
-                        DEBUG_PRINT_ERROR("Failed to set format on capture port");
-                        return false;
-                    }
-                    m_sOutput_buff_property.datasize = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-                }
-                break;
-            }
-        case OMX_QTIIndexParamColorSpaceConversion:
-            {
-                QOMX_ENABLETYPE *pParam = (QOMX_ENABLETYPE *)paramData;
-                csc_enable = pParam->bEnable;
-                DEBUG_PRINT_INFO("CSC settings: Enabled : %d ", pParam->bEnable);
-                break;
-            }
-        case OMX_QTIIndexParamEnableLinearColorFormat:
-            {
-                QOMX_ENABLETYPE *pParam = (QOMX_ENABLETYPE *)paramData;
-                mUseLinearColorFormat = pParam->bEnable ? REQUEST_LINEAR_COLOR_ALL : 0;
-                DEBUG_PRINT_INFO("Linear Color Format Enabled : %d ", pParam->bEnable);
-                break;
-            }
-        case OMX_QTIIndexParamVideoEnableBlur:
-            {
-                OMX_QTI_VIDEO_CONFIG_BLURINFO *pParam = (OMX_QTI_VIDEO_CONFIG_BLURINFO *)paramData;
-                if (!venc_set_blur_resolution(pParam)) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_QTIIndexParamVideoEnableBlur failed");
-                    return false;
-                }
-                break;
-            }
-        case OMX_QTIIndexParamNativeRecorder:
-            {
-                QOMX_ENABLETYPE *pParam = (QOMX_ENABLETYPE *)paramData;
-                mIsNativeRecorder = pParam->bEnable == OMX_TRUE;
-                DEBUG_PRINT_INFO("Native recorder encode session %d", pParam->bEnable);
-                break;
-            }
-        default:
-            DEBUG_PRINT_ERROR("ERROR: Unsupported parameter in venc_set_param: %u",
-                    index);
-            break;
-    }
-
-    return true;
-}
-
-bool venc_dev::venc_set_config(void *configData, OMX_INDEXTYPE index)
-{
-
-    DEBUG_PRINT_LOW("Inside venc_set_config");
-
-    switch ((int)index) {
-        case OMX_IndexConfigVideoBitrate:
-            {
-                OMX_VIDEO_CONFIG_BITRATETYPE *bit_rate = (OMX_VIDEO_CONFIG_BITRATETYPE *)
-                    configData;
-                DEBUG_PRINT_LOW("venc_set_config: OMX_IndexConfigVideoBitrate");
-
-                if (bit_rate->nPortIndex == (OMX_U32)PORT_INDEX_OUT) {
-                    if (venc_set_target_bitrate(bit_rate->nEncodeBitrate) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting Target Bit rate failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoBitrate");
-                }
-
-                break;
-            }
-        case OMX_IndexConfigVideoFramerate:
-            {
-                OMX_CONFIG_FRAMERATETYPE *frame_rate = (OMX_CONFIG_FRAMERATETYPE *)
-                    configData;
-                DEBUG_PRINT_LOW("venc_set_config: OMX_IndexConfigVideoFramerate");
-
-                if (frame_rate->nPortIndex == (OMX_U32)PORT_INDEX_OUT) {
-                    if (venc_set_encode_framerate(frame_rate->xEncodeFramerate) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting Encode Framerate failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoFramerate");
-                }
-
-                break;
-            }
-        case QOMX_IndexConfigVideoIntraperiod:
-            {
-                DEBUG_PRINT_LOW("venc_set_param:QOMX_IndexConfigVideoIntraperiod");
-                QOMX_VIDEO_INTRAPERIODTYPE *intraperiod =
-                    (QOMX_VIDEO_INTRAPERIODTYPE *)configData;
-
-                if (intraperiod->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    if (venc_set_intra_period(intraperiod->nPFrames, intraperiod->nBFrames) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Request for setting intra period failed");
-                        return false;
-                    }
-
-                    if (venc_set_idr_period(intraperiod->nIDRPeriod) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting idr period failed");
-                        return false;
-                    }
-                    client_req_disable_bframe = (intraperiod->nBFrames == 0) ? true : false;
-                }
-
-                break;
-            }
-        case OMX_IndexConfigVideoIntraVOPRefresh:
-            {
-                OMX_CONFIG_INTRAREFRESHVOPTYPE *intra_vop_refresh = (OMX_CONFIG_INTRAREFRESHVOPTYPE *)
-                    configData;
-                DEBUG_PRINT_LOW("venc_set_config: OMX_IndexConfigVideoIntraVOPRefresh");
-
-                if (intra_vop_refresh->nPortIndex == (OMX_U32)PORT_INDEX_OUT) {
-                    if (venc_set_intra_vop_refresh(intra_vop_refresh->IntraRefreshVOP) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting Encode Framerate failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoFramerate");
-                }
-
-                break;
-            }
-        case OMX_IndexConfigCommonMirror:
-            {
-                OMX_CONFIG_MIRRORTYPE *mirror = (OMX_CONFIG_MIRRORTYPE*) configData;
-                DEBUG_PRINT_LOW("venc_set_param: OMX_IndexConfigCommonMirror");
-
-                if (venc_set_mirror(mirror->eMirror) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting OMX_IndexConfigCommonMirror failed");
-                    return false;
-                }
-                break;
-            }
-        case OMX_IndexConfigCommonRotate:
-            {
-                OMX_CONFIG_ROTATIONTYPE *config_rotation =
-                    reinterpret_cast<OMX_CONFIG_ROTATIONTYPE*>(configData);
-                OMX_U32 nFrameWidth;
-                if (!config_rotation) {
-                   return false;
-                }
-                if (true == deinterlace_enabled) {
-                    DEBUG_PRINT_ERROR("ERROR: Rotation is not supported with deinterlacing");
-                    return false;
-                }
-                if(venc_set_vpe_rotation(config_rotation->nRotation) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Dimension Change for Rotation failed");
-                    return false;
-                }
-
-                break;
-            }
-        case OMX_IndexConfigVideoAVCIntraPeriod:
-            {
-                OMX_VIDEO_CONFIG_AVCINTRAPERIOD *avc_iperiod = (OMX_VIDEO_CONFIG_AVCINTRAPERIOD*) configData;
-                DEBUG_PRINT_LOW("venc_set_param: OMX_IndexConfigVideoAVCIntraPeriod");
-
-                if (venc_set_intra_period(avc_iperiod->nPFrames, intra_period.num_bframes) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting intra period failed");
-                    return false;
-                }
-                if (venc_set_idr_period(avc_iperiod->nIDRPeriod) == false) {
-                    DEBUG_PRINT_ERROR("ERROR: Setting idr period failed");
-                    return false;
-                }
-                break;
-            }
-        case OMX_IndexConfigVideoVp8ReferenceFrame:
-            {
-                OMX_VIDEO_VP8REFERENCEFRAMETYPE* vp8refframe = (OMX_VIDEO_VP8REFERENCEFRAMETYPE*) configData;
-                DEBUG_PRINT_LOW("venc_set_config: OMX_IndexConfigVideoVp8ReferenceFrame");
-                if ((vp8refframe->nPortIndex == (OMX_U32)PORT_INDEX_IN) &&
-                        (vp8refframe->bUseGoldenFrame)) {
-                    if(venc_set_useltr(0x1) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: use goldenframe failed");
-                        return false;
-                    }
-                } else if((vp8refframe->nPortIndex == (OMX_U32)PORT_INDEX_IN) &&
-                        (vp8refframe->bGoldenFrameRefresh)) {
-                    if(venc_set_markltr(0x1) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Setting goldenframe failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoVp8ReferenceFrame");
-                }
-                break;
-            }
-        case OMX_QcomIndexConfigVideoLTRUse:
-            {
-                OMX_QCOM_VIDEO_CONFIG_LTRUSE_TYPE* pParam = (OMX_QCOM_VIDEO_CONFIG_LTRUSE_TYPE*)configData;
-                DEBUG_PRINT_LOW("venc_set_config: OMX_QcomIndexConfigVideoLTRUse");
-                if (pParam->nPortIndex == (OMX_U32)PORT_INDEX_IN) {
-                    if (venc_set_useltr(pParam->nID) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Use LTR failed");
-                        return false;
-                    }
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_QcomIndexConfigVideoLTRUse");
-                }
-                break;
-            }
-        case OMX_QcomIndexConfigVideoLTRMark:
-            {
-                OMX_QCOM_VIDEO_CONFIG_LTRMARK_TYPE* pParam = (OMX_QCOM_VIDEO_CONFIG_LTRMARK_TYPE*)configData;
-                DEBUG_PRINT_LOW("venc_set_config: OMX_QcomIndexConfigVideoLTRMark");
-                if (pParam->nPortIndex == (OMX_U32)PORT_INDEX_IN) {
-                    if (venc_set_markltr(pParam->nID) == false) {
-                        DEBUG_PRINT_ERROR("ERROR: Mark LTR failed");
-                        return false;
-                    }
-                }  else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_QcomIndexConfigVideoLTRMark");
-                }
-                break;
-            }
-        case OMX_IndexConfigAndroidVideoTemporalLayering:
-            {
-                OMX_VIDEO_CONFIG_ANDROID_TEMPORALLAYERINGTYPE *pParam =
-                    (OMX_VIDEO_CONFIG_ANDROID_TEMPORALLAYERINGTYPE *) configData;
-                OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE temporalParams;
-
-                memset(&temporalParams, 0x0, sizeof(temporalParams));
-                temporalParams.nPLayerCountActual      = pParam->nPLayerCountActual;
-                temporalParams.bBitrateRatiosSpecified = pParam->bBitrateRatiosSpecified;
-                temporalParams.ePattern                = pParam->ePattern;
-                temporalParams.nLayerCountMax          = temporal_layers_config.nMaxLayers;
-
-                if (temporalParams.bBitrateRatiosSpecified == OMX_TRUE) {
-                    for (OMX_U32 i = 0; i < temporalParams.nPLayerCountActual; ++i) {
-                        temporalParams.nBitrateRatios[i] = pParam->nBitrateRatios[i];
-                    }
-                }
-
-                if (!venc_validate_temporal_extn(temporalParams)) {
-                    DEBUG_PRINT_ERROR("set_param: Failed to validate temporal settings");
-                    return false;
-                }
-
-                venc_copy_temporal_settings(temporalParams);
-
-                // Set temporal layers with these settings
-                if (!venc_reconfigure_temporal_settings()) {
-                    DEBUG_PRINT_ERROR("Reconfiguring temporal settings failed");
-                    return false;
-                }
-
-                break;
-            }
-        case OMX_QcomIndexConfigBaseLayerId:
-            {
-                OMX_SKYPE_VIDEO_CONFIG_BASELAYERPID* pParam =
-                    (OMX_SKYPE_VIDEO_CONFIG_BASELAYERPID*) configData;
-                if (venc_set_baselayerid(pParam->nPID) == false) {
-                    DEBUG_PRINT_ERROR("Failed to set OMX_QcomIndexConfigBaseLayerId failed");
-                    return false;
-                }
-                break;
-            }
-        case OMX_IndexParamAndroidVideoTemporalLayering:
-            {
-                DEBUG_PRINT_ERROR("TemporalLayer: Changing layer-configuration dynamically is not supported!");
-                return false;
-            }
-        case OMX_QcomIndexConfigQp:
-            {
-                OMX_QCOM_VIDEO_CONFIG_QP* pParam =
-                    (OMX_QCOM_VIDEO_CONFIG_QP*) configData;
-                DEBUG_PRINT_LOW("Set_config: nQP %d", pParam->nQP);
-                if (venc_set_qp(pParam->nQP,
-                                pParam->nQP,
-                                pParam->nQP,
-                                ENABLE_I_QP | ENABLE_P_QP | ENABLE_B_QP ) == false) {
-                    DEBUG_PRINT_ERROR("Failed to set OMX_QcomIndexConfigQp failed");
-                    return false;
-                }
-                break;
-            }
-        case OMX_IndexConfigPriority:
-            {
-                OMX_PARAM_U32TYPE *priority = (OMX_PARAM_U32TYPE *)configData;
-                DEBUG_PRINT_LOW("Set_config: priority %d",priority->nU32);
-                if (!venc_set_priority(priority->nU32)) {
-                    DEBUG_PRINT_ERROR("Failed to set priority");
-                    return false;
-                }
-                sess_priority.priority = priority->nU32;
-                break;
-            }
-        case OMX_IndexConfigOperatingRate:
-            {
-                OMX_PARAM_U32TYPE *rate = (OMX_PARAM_U32TYPE *)configData;
-                DEBUG_PRINT_LOW("Set_config: operating rate %u", rate->nU32);
-                if (!venc_set_operatingrate(rate->nU32)) {
-                    DEBUG_PRINT_ERROR("Failed to set operating rate");
-                    return false;
-                }
-                break;
-            }
-        case OMX_IndexConfigAndroidIntraRefresh:
-            {
-                OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *intra_refresh_period = (OMX_VIDEO_CONFIG_ANDROID_INTRAREFRESHTYPE *)configData;
-                DEBUG_PRINT_LOW("OMX_IndexConfigAndroidIntraRefresh : num frames = %d", intra_refresh_period->nRefreshPeriod);
-
-                if (intra_refresh_period->nPortIndex == (OMX_U32) PORT_INDEX_OUT) {
-                    intra_refresh.framecount = intra_refresh_period->nRefreshPeriod;
-                    intra_refresh.irmode     = OMX_VIDEO_IntraRefreshMax;
-                    intra_refresh.mbcount    = 0;
-                } else {
-                    DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoIntraRefreshType");
-                }
-                break;
-            }
-        case OMX_QTIIndexConfigVideoBlurResolution:
-        {
-             OMX_QTI_VIDEO_CONFIG_BLURINFO *blur = (OMX_QTI_VIDEO_CONFIG_BLURINFO *)configData;
-             if (blur->nPortIndex == (OMX_U32)PORT_INDEX_IN) {
-                 DEBUG_PRINT_LOW("Set_config: blur resolution: %u", blur->nBlurInfo);
-                 if(!venc_set_blur_resolution(blur)) {
-                    DEBUG_PRINT_ERROR("Failed to set Blur Resolution");
-                    return false;
-                 }
-             } else {
-                  DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_QTIIndexConfigVideoBlurResolution");
-                  return false;
-             }
-             break;
-        }
-        case OMX_QcomIndexConfigH264Transform8x8:
-        {
-            OMX_CONFIG_BOOLEANTYPE *pEnable = (OMX_CONFIG_BOOLEANTYPE *) configData;
-            DEBUG_PRINT_LOW("venc_set_config: OMX_QcomIndexConfigH264Transform8x8");
-            if (venc_h264_transform_8x8(pEnable->bEnabled) == false) {
-                DEBUG_PRINT_ERROR("Failed to set OMX_QcomIndexConfigH264Transform8x8");
-                return false;
-            }
-            break;
-        }
-        case OMX_QTIIndexConfigDescribeColorAspects:
-            {
-                DescribeColorAspectsParams *params = (DescribeColorAspectsParams *)configData;
-
-                OMX_U32 color_space = MSM_VIDC_BT601_6_625;
-                OMX_U32 full_range = 0;
-                OMX_U32 matrix_coeffs = MSM_VIDC_MATRIX_601_6_625;
-                OMX_U32 transfer_chars = MSM_VIDC_TRANSFER_601_6_625;
-
-                switch((ColorAspects::Primaries)(params->sAspects.mPrimaries)) {
-                    case ColorAspects::PrimariesBT709_5:
-                        color_space = MSM_VIDC_BT709_5;
-                        break;
-                    case ColorAspects::PrimariesBT470_6M:
-                        color_space = MSM_VIDC_BT470_6_M;
-                        break;
-                    case ColorAspects::PrimariesBT601_6_625:
-                        color_space = MSM_VIDC_BT601_6_625;
-                        break;
-                    case ColorAspects::PrimariesBT601_6_525:
-                        color_space = MSM_VIDC_BT601_6_525;
-                        break;
-                    case ColorAspects::PrimariesGenericFilm:
-                        color_space = MSM_VIDC_GENERIC_FILM;
-                        break;
-                    case ColorAspects::PrimariesBT2020:
-                        color_space = MSM_VIDC_BT2020;
-                        break;
-                    default:
-                        color_space = MSM_VIDC_BT601_6_625;
-                        //params->sAspects.mPrimaries = ColorAspects::PrimariesBT601_6_625;
-                        break;
-                }
-                switch((ColorAspects::Range)params->sAspects.mRange) {
-                    case ColorAspects::RangeFull:
-                        full_range = 1;
-                        break;
-                    case ColorAspects::RangeLimited:
-                        full_range = 0;
-                        break;
-                    default:
-                        break;
-                }
-                switch((ColorAspects::Transfer)params->sAspects.mTransfer) {
-                    case ColorAspects::TransferSMPTE170M:
-                        transfer_chars = MSM_VIDC_TRANSFER_601_6_525;
-                        break;
-                    case ColorAspects::TransferUnspecified:
-                        transfer_chars = MSM_VIDC_TRANSFER_UNSPECIFIED;
-                        break;
-                    case ColorAspects::TransferGamma22:
-                        transfer_chars = MSM_VIDC_TRANSFER_BT_470_6_M;
-                        break;
-                    case ColorAspects::TransferGamma28:
-                        transfer_chars = MSM_VIDC_TRANSFER_BT_470_6_BG;
-                        break;
-                    case ColorAspects::TransferSMPTE240M:
-                        transfer_chars = MSM_VIDC_TRANSFER_SMPTE_240M;
-                        break;
-                    case ColorAspects::TransferLinear:
-                        transfer_chars = MSM_VIDC_TRANSFER_LINEAR;
-                        break;
-                    case ColorAspects::TransferXvYCC:
-                        transfer_chars = MSM_VIDC_TRANSFER_IEC_61966;
-                        break;
-                    case ColorAspects::TransferBT1361:
-                        transfer_chars = MSM_VIDC_TRANSFER_BT_1361;
-                        break;
-                    case ColorAspects::TransferSRGB:
-                        transfer_chars = MSM_VIDC_TRANSFER_SRGB;
-                        break;
-                    default:
-                        //params->sAspects.mTransfer = ColorAspects::TransferSMPTE170M;
-                        transfer_chars = MSM_VIDC_TRANSFER_601_6_625;
-                        break;
-                }
-                switch((ColorAspects::MatrixCoeffs)params->sAspects.mMatrixCoeffs) {
-                    case ColorAspects::MatrixUnspecified:
-                        matrix_coeffs = MSM_VIDC_MATRIX_UNSPECIFIED;
-                        break;
-                    case ColorAspects::MatrixBT709_5:
-                        matrix_coeffs = MSM_VIDC_MATRIX_BT_709_5;
-                        break;
-                    case ColorAspects::MatrixBT470_6M:
-                        matrix_coeffs = MSM_VIDC_MATRIX_FCC_47;
-                        break;
-                    case ColorAspects::MatrixBT601_6:
-                        matrix_coeffs = MSM_VIDC_MATRIX_601_6_525;
-                        break;
-                    case ColorAspects::MatrixSMPTE240M:
-                        matrix_coeffs = MSM_VIDC_MATRIX_SMPTE_240M;
-                        break;
-                    case ColorAspects::MatrixBT2020:
-                        matrix_coeffs = MSM_VIDC_MATRIX_BT_2020;
-                        break;
-                    case ColorAspects::MatrixBT2020Constant:
-                        matrix_coeffs = MSM_VIDC_MATRIX_BT_2020_CONST;
-                        break;
-                    default:
-                        //params->sAspects.mMatrixCoeffs = ColorAspects::MatrixBT601_6;
-                        matrix_coeffs = MSM_VIDC_MATRIX_601_6_625;
-                        break;
-                }
-                if (!venc_set_colorspace(color_space, full_range,
-                            transfer_chars, matrix_coeffs)) {
-
-                    DEBUG_PRINT_ERROR("Failed to set operating rate");
-                    return false;
-                }
-                break;
-            }
-        case OMX_QTIIndexConfigVideoRoiInfo:
-        {
-            if(!venc_set_roi_qp_info((OMX_QTI_VIDEO_CONFIG_ROIINFO *)configData)) {
-                DEBUG_PRINT_ERROR("Failed to set ROI QP info");
-                return false;
-            }
-            break;
-        }
-        case OMX_IndexConfigVideoNalSize:
-        {
-            if(!venc_set_nal_size((OMX_VIDEO_CONFIG_NALSIZE *)configData)) {
-                DEBUG_PRINT_LOW("Failed to set Nal size info");
-                return false;
-            }
-            break;
-        }
-        case OMX_QTIIndexConfigVideoRoiRectRegionInfo:
-        {
-            if(!venc_set_roi_region_qp_info((OMX_QTI_VIDEO_CONFIG_ROI_RECT_REGION_INFO *)configData)) {
-                DEBUG_PRINT_ERROR("Failed to set ROI Region QP info");
-                return false;
-            }
-            break;
-        }
-        default:
-            DEBUG_PRINT_ERROR("Unsupported config index = %u", index);
-            break;
-    }
 
     return true;
 }
@@ -3491,17 +2038,6 @@ bool venc_dev::venc_handle_empty_eos_buffer( void)
         enum v4l2_buf_type buf_type;
         struct v4l2_control control;
         int ret = 0;
-
-        /* If first ETB is an EOS with 0 filled length there is a limitation */
-        /* for which we need to combine sequence header with 1st frame       */
-        control.id = V4L2_CID_MPEG_VIDEO_HEADER_MODE;
-        control.value = V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME;
-        DEBUG_PRINT_LOW("Combining sequence header with 1st frame ");
-        ret = ioctl(m_nDriver_fd,  VIDIOC_S_CTRL, &control);
-        if (ret) {
-            DEBUG_PRINT_ERROR("Failed to set header mode");
-            return false;
-        }
 
         buf_type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 
@@ -3641,79 +2177,30 @@ unsigned venc_dev::venc_set_message_thread_id(pthread_t tid)
     return 0;
 }
 
-bool venc_dev::venc_set_vqzip_defaults()
+bool venc_dev::venc_set_extradata_hdr10metadata(OMX_U32 omx_profile)
 {
-    struct v4l2_control control;
-    int rc = 0, num_mbs_per_frame;
-
-    num_mbs_per_frame = m_sVenc_cfg.input_height * m_sVenc_cfg.input_width;
-
-    switch (num_mbs_per_frame) {
-    case OMX_CORE_720P_WIDTH  * OMX_CORE_720P_HEIGHT:
-    case OMX_CORE_1080P_WIDTH * OMX_CORE_1080P_HEIGHT:
-    case OMX_CORE_4KUHD_WIDTH * OMX_CORE_4KUHD_HEIGHT:
-    case OMX_CORE_4KDCI_WIDTH * OMX_CORE_4KDCI_HEIGHT:
-        break;
-    default:
-        DEBUG_PRINT_ERROR("VQZIP is not supported for this resoultion : %lu X %lu",
-            m_sVenc_cfg.input_width, m_sVenc_cfg.input_height);
-        return false;
-    }
-
-    control.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
-    control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_RC_OFF;
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc)
-        DEBUG_PRINT_ERROR("Failed to set Rate Control OFF for VQZIP");
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES;
-    control.value = INT_MAX;
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc)
-        DEBUG_PRINT_ERROR("Failed to set P frame period for VQZIP");
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_B_FRAMES;
-    control.value = 0;
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc)
-        DEBUG_PRINT_ERROR("Failed to set B frame period for VQZIP");
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_IDR_PERIOD;
-    control.value = 1;
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc)
-        DEBUG_PRINT_ERROR("Failed to set IDR period for VQZIP");
-
-    return true;
-}
-bool venc_dev::venc_set_extradata_hdr10metadata()
-{
-    struct v4l2_control control;
-
-    /* HDR10 Metadata is enabled by default for HEVC Main10 profile. */
+    /* HDR10 Metadata is enabled by default for HEVC Main10PLUS profile. */
     if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC &&
-        codec_profile.profile == V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN10) {
-
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_EXTRADATA;
-        control.value = V4L2_MPEG_VIDC_EXTRADATA_HDR10PLUS_METADATA;
-
+        omx_profile == OMX_VIDEO_HEVCProfileMain10HDR10Plus) {
         DEBUG_PRINT_HIGH("venc_set_extradata:: HDR10PLUS_METADATA");
+        struct v4l2_control control;
+        control.id = V4L2_CID_MPEG_VIDC_VIDEO_EXTRADATA;
+        control.value = EXTRADATA_ENC_INPUT_HDR10PLUS;
 
         if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
             DEBUG_PRINT_ERROR("ERROR: Set extradata HDR10PLUS_METADATA failed %d", errno);
             return false;
         }
+
         m_hdr10meta_enabled = true;
-        extradata = true;
 
         //Get upated buffer requirement as enable extradata leads to two buffer planes
         venc_get_buf_req (&venc_handle->m_sInPortDef.nBufferCountMin,
-                                 &venc_handle->m_sInPortDef.nBufferCountActual,
-                                 &venc_handle->m_sInPortDef.nBufferSize,
-                                 venc_handle->m_sInPortDef.nPortIndex);
+                          &venc_handle->m_sInPortDef.nBufferCountActual,
+                          &venc_handle->m_sInPortDef.nBufferSize,
+                          venc_handle->m_sInPortDef.nPortIndex);
+    } else {
+        m_hdr10meta_enabled = false;
     }
 
     return true;
@@ -3727,82 +2214,11 @@ unsigned venc_dev::venc_start(void)
 
     memset(&control, 0, sizeof(control));
 
-    if (vqzip_sei_info.enabled && !venc_set_vqzip_defaults())
-        return 1;
-
-    if (!venc_set_priority(sess_priority.priority)) {
-        DEBUG_PRINT_ERROR("Failed to set priority");
-        return 1;
-    }
-    // Client can set intra refresh period in terms of frames.
-    // This requires reconfiguration on port redefinition as
-    // mbcount for IR depends on encode resolution.
-    if (!venc_reconfigure_intra_refresh_period()) {
-        DEBUG_PRINT_ERROR("Reconfiguring intra refresh period failed");
-        return 1;
-    }
-
-    if (!venc_reconfigure_intra_period()) {
-        DEBUG_PRINT_ERROR("Reconfiguring intra period failed");
-        return 1;
-    }
-
-    // re-configure the temporal layers as RC-mode and key-frame interval
-    // might have changed since the client last configured the layers.
-    if (!venc_reconfigure_temporal_settings()) {
-        DEBUG_PRINT_ERROR("Reconfiguring temporal settings failed");
-        return 1;
-    }
-
-    // Note HP settings could change GOP structure
-    if (!venc_set_intra_period(intra_period.num_pframes, intra_period.num_bframes)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to set nPframes/nBframes");
-        return OMX_ErrorUndefined;
-    }
-
-    // If Hybrid HP is enable, LTR needs to be reset
-    if (!venc_reconfigure_ltrmode()) {
-        DEBUG_PRINT_ERROR("Reconfiguring LTR mode failed");
-        return 1;
-    }
-
-    if (hdr10metadata_supported == true) {
-        venc_set_extradata_hdr10metadata();
-    }
-
     venc_config_print();
 
     /* set buffercount before start */
     venc_reconfig_reqbufs();
     resume_in_stopped = 0;
-
-    /* Check if slice_delivery mode is enabled & max slices is sufficient for encoding complete frame */
-    if (slice_mode.enable && multislice.mslice_size &&
-            (m_sVenc_cfg.dvs_width *  m_sVenc_cfg.dvs_height)/(256 * multislice.mslice_size) >= MAX_SUPPORTED_SLICES_PER_FRAME) {
-        DEBUG_PRINT_ERROR("slice_mode: %lu, max slices (%lu) should be less than (%d)", slice_mode.enable,
-                (m_sVenc_cfg.dvs_width *  m_sVenc_cfg.dvs_height)/(256 * multislice.mslice_size),
-                MAX_SUPPORTED_SLICES_PER_FRAME);
-        return 1;
-    }
-
-    if (m_codec == OMX_VIDEO_CodingImageHEIC && mIsGridset) {
-        struct v4l2_format fmt;
-        memset(&fmt, 0, sizeof(fmt));
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        fmt.fmt.pix_mp.height = DEFAULT_TILE_DIMENSION;
-        fmt.fmt.pix_mp.width = DEFAULT_TILE_DIMENSION;
-        fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.codectype;
-        DEBUG_PRINT_INFO("set format type %d, wxh %dx%d, pixelformat %#x",
-            fmt.type, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
-            fmt.fmt.pix_mp.pixelformat);
-        if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
-            DEBUG_PRINT_ERROR("set format failed, type %d, wxh %dx%d, pixelformat %#x",
-                fmt.type, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
-                fmt.fmt.pix_mp.pixelformat);
-            hw_overload = errno == EBUSY;
-            return false;
-        }
-    }
 
     buf_type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     DEBUG_PRINT_LOW("send_command_proxy(): Idle-->Executing");
@@ -3827,8 +2243,6 @@ inline const char* hiermode_string(int val)
         return "Hier-P";
     case HIER_B:
         return "Hier-B";
-    case HIER_P_HYBRID:
-        return "Hybrid Hier-P";
     default:
         return "No hier";
     }
@@ -3883,10 +2297,8 @@ void venc_dev::venc_config_print()
     DEBUG_PRINT_HIGH("ENC_CONFIG: qpI: %ld, qpP: %ld, qpb: %ld enableqp : %ld",
             session_qp.iframeqp, session_qp.pframeqp, session_qp.bframeqp, session_qp.enableqp);
 
-    DEBUG_PRINT_HIGH("ENC_CONFIG: minIQP: %lu, maxIQP: %lu minPQP : %lu maxPQP : %lu minBQP : %lu maxBQP : %lu",
-            session_ipb_qp_values.min_i_qp, session_ipb_qp_values.max_i_qp,
-            session_ipb_qp_values.min_p_qp, session_ipb_qp_values.max_p_qp,
-            session_ipb_qp_values.min_b_qp, session_ipb_qp_values.max_b_qp);
+    DEBUG_PRINT_HIGH("ENC_CONFIG: minQP: %lu, maxQP: %lu",
+                     session_ipb_qp_values.min_qp_packed, session_ipb_qp_values.max_qp_packed);
 
     DEBUG_PRINT_HIGH("ENC_CONFIG: VOP_Resolution: %ld, Slice-Mode: %ld, Slize_Size: %ld",
             voptimecfg.voptime_resolution, multislice.mslice_mode,
@@ -3902,31 +2314,10 @@ void venc_dev::venc_config_print()
     DEBUG_PRINT_HIGH("ENC_CONFIG: HEC: %ld, IDR Period: %ld",
             hec.header_extension, idrperiod.idrperiod);
 
-    DEBUG_PRINT_HIGH("ENC_CONFIG: LTR Enabled: %d, Count: %d",
-            ltrinfo.enabled, ltrinfo.count);
-
     if (temporal_layers_config.nPLayers) {
         DEBUG_PRINT_HIGH("ENC_CONFIG: Temporal layers: P-layers: %u, B-layers: %u, Adjusted I-frame-interval: %lu",
                 temporal_layers_config.nPLayers, temporal_layers_config.nBLayers,
                 intra_period.num_pframes + intra_period.num_bframes + 1);
-
-        for (OMX_U32 l = 0; temporal_layers_config.bIsBitrateRatioValid
-                && (l < temporal_layers_config.nPLayers + temporal_layers_config.nBLayers); ++l) {
-            DEBUG_PRINT_HIGH("ENC_CONFIG: Temporal layers: layer[%d] bitrate %% = %u%%",
-                    l, temporal_layers_config.nTemporalLayerBitrateFraction[l]);
-        }
-    } else {
-
-        DEBUG_PRINT_HIGH("ENC_CONFIG: Hier layers: %d, Hier Mode: %s VPX_ErrorResilience: %d",
-                temporal_layers_config.nPLayers, hiermode_string(temporal_layers_config.hier_mode), vpx_err_resilience.enable);
-
-        DEBUG_PRINT_HIGH("ENC_CONFIG: Hier params: Frame Interval : %d, MinQP: %d, Max_QP: %d",
-                temporal_layers_config.nKeyFrameInterval, temporal_layers_config.nMinQuantizer, temporal_layers_config.nMaxQuantizer);
-
-        DEBUG_PRINT_HIGH("ENC_CONFIG: Hybrid_HP PARAMS: Layer0: %d, Layer1: %d, Later2: %d, Layer3: %d, Layer4: %d, Layer5: %d",
-                temporal_layers_config.nTemporalLayerBitrateRatio[0], temporal_layers_config.nTemporalLayerBitrateRatio[1],
-                temporal_layers_config.nTemporalLayerBitrateRatio[2], temporal_layers_config.nTemporalLayerBitrateRatio[3],
-                temporal_layers_config.nTemporalLayerBitrateRatio[4], temporal_layers_config.nTemporalLayerBitrateRatio[5]);
     }
 
     DEBUG_PRINT_HIGH("ENC_CONFIG: VUI timing info enabled: %d", vui_timing_info.enabled);
@@ -3970,12 +2361,8 @@ unsigned venc_dev::venc_flush( unsigned port)
     struct v4l2_encoder_cmd enc;
     DEBUG_PRINT_LOW("in %s", __func__);
 
-    for (unsigned int i = 0; i < (sizeof(fd_list)/sizeof(fd_list[0])); i++) {
-        fd_list[i] = 0;
-    }
-
-    enc.cmd = V4L2_QCOM_CMD_FLUSH;
-    enc.flags = V4L2_QCOM_CMD_FLUSH_OUTPUT | V4L2_QCOM_CMD_FLUSH_CAPTURE;
+    enc.cmd = V4L2_CMD_FLUSH;
+    enc.flags = V4L2_CMD_FLUSH_OUTPUT | V4L2_CMD_FLUSH_CAPTURE;
 
     if (ioctl(m_nDriver_fd, VIDIOC_ENCODER_CMD, &enc)) {
         DEBUG_PRINT_ERROR("Flush Port (%d) Failed ", port);
@@ -4121,17 +2508,6 @@ bool venc_dev::venc_get_vui_timing_info(OMX_U32 *enabled)
     }
 }
 
-bool venc_dev::venc_get_vqzip_sei_info(OMX_U32 *enabled)
-{
-    if (!enabled) {
-        DEBUG_PRINT_ERROR("Null pointer error");
-        return false;
-    } else {
-        *enabled = vqzip_sei_info.enabled;
-        return true;
-    }
-}
-
 bool venc_dev::venc_get_peak_bitrate(OMX_U32 *peakbitrate)
 {
     if (!peakbitrate) {
@@ -4154,6 +2530,15 @@ bool venc_dev::venc_get_batch_size(OMX_U32 *size)
     }
 }
 
+bool venc_dev::venc_get_buffer_mode()
+{
+    return metadatamode;
+}
+
+bool venc_dev::venc_is_avtimer_needed()
+{
+    return mUseAVTimerTimestamps;
+}
 
 bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index, unsigned fd)
 {
@@ -4161,7 +2546,7 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
     struct v4l2_buffer buf;
     struct v4l2_requestbuffers bufreq;
     struct v4l2_plane plane[VIDEO_MAX_PLANES];
-    int rc = 0, extra_idx;
+    int rc = 0, extra_idx, c2d_enabled = 0;
     bool interlace_flag = false;
     struct OMX_BUFFERHEADERTYPE *bufhdr;
     LEGACY_CAM_METADATA_TYPE * meta_buf = NULL;
@@ -4179,8 +2564,6 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
     bufreq.memory = V4L2_MEMORY_USERPTR;
     bufreq.count = m_sInput_buff_property.actualcount;
     bufreq.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-
-    DEBUG_PRINT_LOW("Input buffer length %u, Timestamp = %lld", (unsigned int)bufhdr->nFilledLen, bufhdr->nTimeStamp);
 
     if (pmem_data_buf) {
         DEBUG_PRINT_LOW("\n Internal PMEM addr for i/p Heap UseBuf: %p", pmem_data_buf);
@@ -4330,6 +2713,11 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                                              colorData.dynamicMetaDataValid, colorData.dynamicMetaDataLen);
                         }
 
+                        if (!venc_cvp_enable(handle)) {
+                            DEBUG_PRINT_ERROR("ERROR: Setting CVP enable");
+                            return false;
+                        }
+
                         struct v4l2_format fmt;
                         memset(&fmt, 0, sizeof(fmt));
                         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -4345,9 +2733,8 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
 
                         if (m_codec == OMX_VIDEO_CodingHEVC && (handle->format == HAL_PIXEL_FORMAT_YCbCr_420_TP10_UBWC ||
                             handle->format == HAL_PIXEL_FORMAT_YCbCr_420_P010_VENUS) &&
-                            codec_profile.profile != V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN10)
+                            codec_profile.profile != V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)
                             {
-                                is_hevcprofile_explicitly_set = true;
                                 if (!venc_set_profile (OMX_VIDEO_HEVCProfileMain10)) {
                                     DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating Profile OMX_VIDEO_HEVCProfileMain10");
                                     return false;
@@ -4362,6 +2749,12 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                         } else if (handle->format == HAL_PIXEL_FORMAT_YCbCr_420_SP_VENUS_UBWC) {
                             m_sVenc_cfg.inputformat = V4L2_PIX_FMT_NV12_UBWC;
                             DEBUG_PRINT_INFO("ENC_CONFIG: Input Color = NV12_UBWC");
+                        } else if (handle->format == VIDC_HAL_PIXEL_FORMAT_NV12_LINEAR_FLEX) {
+                             m_sVenc_cfg.inputformat = V4L2_PIX_FMT_NV12;
+                             DEBUG_PRINT_INFO("ENC_CONFIG: Input Color = NV12 FLEX");
+                        } else if (handle->format == VIDC_HAL_PIXEL_FORMAT_NV12_UBWC_FLEX) {
+                            m_sVenc_cfg.inputformat = V4L2_PIX_FMT_NV12_UBWC;
+                            DEBUG_PRINT_INFO("ENC_CONFIG: Input Color = NV12 UBWC FLEX");
                         } else if (handle->format == HAL_PIXEL_FORMAT_RGBA_8888) {
                             // In case of RGB, conversion to YUV is handled within encoder.
                             // Disregard the Colorspace in gralloc-handle in case of RGB and use
@@ -4379,8 +2772,9 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                             DEBUG_PRINT_INFO("ENC_CONFIG: Input Color = NV12 Linear");
                         } else if (handle->format == HAL_PIXEL_FORMAT_YCbCr_420_TP10_UBWC ||
                                    handle->format == HAL_PIXEL_FORMAT_YCbCr_420_P010_VENUS) {
-                            if ((m_codec == OMX_VIDEO_CodingHEVC) &&
-                                 (codec_profile.profile == V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN10)) {
+                            if (((m_codec == OMX_VIDEO_CodingHEVC) &&
+                                 (codec_profile.profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)) ||
+                                     (csc_enable == true)) {
                                 m_sVenc_cfg.inputformat =
                                     (handle->format == HAL_PIXEL_FORMAT_YCbCr_420_TP10_UBWC)?
                                              V4L2_PIX_FMT_NV12_TP10_UBWC :
@@ -4415,12 +2809,6 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
 
                         if (csc_enable) {
                             struct v4l2_control control;
-
-                            /* Set Camera Color Space. When we set CSC, this will be passed to
-                               fimrware as the InputPrimaries */
-                            venc_set_colorspace(colorData.colorPrimaries, colorData.range,
-                                                colorData.transfer, colorData.matrixCoefficients);
-
                             control.id = V4L2_CID_MPEG_VIDC_VIDEO_VPE_CSC;
                             control.value = V4L2_MPEG_MSM_VIDC_ENABLE;
                             if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
@@ -4436,11 +2824,6 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                                         DEBUG_PRINT_INFO("venc_empty_buf: Enabled VPE CSC custom matrix");
                                     }
                                 }
-                                /* Change Colorspace to 709*/
-                                colorData.colorPrimaries =  ColorPrimaries_BT709_5;
-                                colorData.range = Range_Limited;
-                                colorData.transfer = Transfer_sRGB;
-                                colorData.matrixCoefficients = MatrixCoEff_BT709_5;
                             }
                         }
 
@@ -4448,6 +2831,13 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                            as it is standard compliant */
                         venc_set_colorspace(colorData.colorPrimaries, colorData.range,
                                             colorData.transfer, colorData.matrixCoefficients);
+                        if ((handle->format == VIDC_HAL_PIXEL_FORMAT_NV12_LINEAR_FLEX) ||
+                                (handle->format == VIDC_HAL_PIXEL_FORMAT_NV12_UBWC_FLEX)) {
+                            if (!venc_superframe_enable(handle)) {
+                                DEBUG_PRINT_ERROR("ERROR: Enabling Superframe");
+                                return false;
+                            }
+                        }
 
                         fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.inputformat;
                         fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
@@ -4469,21 +2859,18 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                         }
                     } // Check OUTPUT Streaming
 
+                    if (!venc_get_cvp_metadata(handle, &buf))
+                        return false;
+
                     struct UBWCStats cam_ubwc_stats[2];
                     unsigned long long int compression_ratio = 1 << 16;
 
                     if (getMetaData(handle, GET_UBWC_CR_STATS_INFO, (void *)cam_ubwc_stats) == 0) {
                         if (cam_ubwc_stats[0].bDataValid) {
                             switch (cam_ubwc_stats[0].version) {
-                            case UBWC_1_0:
-                                {
-                                    // Camera hw doesn't support UBWC stats in trinket and sends
-                                    // a hardcoded compression factor in nCRStatsTile32
-                                    compression_ratio = cam_ubwc_stats[0].ubwc_stats.nCRStatsTile32;
-                                }
-                                break;
                             case UBWC_2_0:
                             case UBWC_3_0:
+                            case UBWC_4_0:
                                 {
                                     unsigned long long int sum = 0, weighted_sum = 0;
 
@@ -4527,9 +2914,8 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
 
                     uint32_t encodePerfMode = 0;
                     if (getMetaData(handle, GET_VIDEO_PERF_MODE, &encodePerfMode) == 0) {
-                        if (encodePerfMode == OMX_TRUE) {
-                            buf.flags |= V4L2_QCOM_BUF_FLAG_PERF_MODE;
-                        }
+                        if (encodePerfMode == OMX_TRUE)
+                            buf.flags |= V4L2_BUF_FLAG_PERF_MODE;
                         // Clear SET_VIDEO_PERF_MODE in buffer handle
                         setMetaData(handle, SET_VIDEO_PERF_MODE, 0);
                     }
@@ -4537,20 +2923,21 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                     plane[0].data_offset = 0;
                     plane[0].length = handle->size;
                     plane[0].bytesused = handle->size;
-                    plane[0].reserved[2] = (unsigned long int)compression_ratio;
+                    plane[0].reserved[MSM_VIDC_COMP_RATIO] = (unsigned long int)compression_ratio;
                     char v4l2ColorFormatStr[200];
                     get_v4l2_color_format_as_string(v4l2ColorFormatStr, sizeof(v4l2ColorFormatStr), m_sVenc_cfg.inputformat);
                     DEBUG_PRINT_LOW("venc_empty_buf: Opaque camera buf: fd = %d "
                                 ": filled %d of %d format 0x%lx (%s) CR %d", fd, plane[0].bytesused,
-                                plane[0].length, m_sVenc_cfg.inputformat, v4l2ColorFormatStr, plane[0].reserved[2]);
+                                plane[0].length, m_sVenc_cfg.inputformat, v4l2ColorFormatStr, plane[0].reserved[MSM_VIDC_COMP_RATIO]);
                 }
             } else {
                 // Metadata mode
                 // color_format == 1 ==> RGBA to YUV Color-converted buffer
-                // Buffers color-converted via C2D have 601-Limited color
+                // Buffers color-converted via C2D have 601 color
                 if (!streaming[OUTPUT_PORT]) {
-                    DEBUG_PRINT_HIGH("Setting colorspace 601-L for Color-converted buffer");
-                    venc_set_colorspace(MSM_VIDC_BT601_6_625, 0 /*range-limited*/,
+                    c2d_enabled = 1;
+                    DEBUG_PRINT_HIGH("Setting colorspace 601 for Color-converted buffer");
+                    venc_set_colorspace(MSM_VIDC_BT601_6_625, color_space.range,
                             MSM_VIDC_TRANSFER_601_6_525, MSM_VIDC_MATRIX_601_6_525);
                 }
                 plane[0].m.userptr = (unsigned long) bufhdr->pBuffer;
@@ -4570,90 +2957,29 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
         }
     }
 
-    if (!streaming[OUTPUT_PORT] &&
-        (m_sVenc_cfg.inputformat != V4L2_PIX_FMT_NV12_TP10_UBWC &&
-         m_sVenc_cfg.inputformat != V4L2_PIX_FMT_NV12_UBWC)) {
-        if (bframe_implicitly_enabled) {
-            DEBUG_PRINT_HIGH("Disabling implicitly enabled B-frames");
-            intra_period.num_pframes = nPframes_cache;
-            if (!_venc_set_intra_period(intra_period.num_pframes, 0)) {
-                DEBUG_PRINT_ERROR("Failed to set nPframes/nBframes");
-                return OMX_ErrorUndefined;
-            }
-        }
-    }
-
-    extra_idx = EXTRADATA_IDX(num_input_planes);
-
-    if (extra_idx && (extra_idx < VIDEO_MAX_PLANES)) {
-        OMX_U32 extradata_index;
-        if (!venc_get_index_from_fd(fd, &extradata_index)) {
-            return false;
-        }
-
-        plane[extra_idx].bytesused = 0;
-        plane[extra_idx].length = input_extradata_info.size;
-        plane[extra_idx].m.userptr = (unsigned long) (input_extradata_info.uaddr + extradata_index * input_extradata_info.buffer_size);
-#ifdef USE_ION
-        plane[extra_idx].reserved[0] = input_extradata_info.ion.data_fd;
-#endif
-        plane[extra_idx].reserved[1] = input_extradata_info.buffer_size * extradata_index;
-        plane[extra_idx].reserved[2] = input_extradata_info.size;
-        plane[extra_idx].data_offset = 0;
-    } else if (extra_idx >= VIDEO_MAX_PLANES) {
-        DEBUG_PRINT_ERROR("Extradata index higher than expected: %d\n", extra_idx);
+    if (!handle_dynamic_config(bufhdr)) {
+        DEBUG_PRINT_ERROR("%s Failed to set dynamic configs", __func__);
         return false;
     }
-
-    buf.index = index;
-    buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    buf.memory = V4L2_MEMORY_USERPTR;
-    plane[0].reserved[0] = fd;
-    plane[0].reserved[1] = 0;
-    buf.m.planes = plane;
-    buf.length = num_input_planes;
-    buf.timestamp.tv_sec = bufhdr->nTimeStamp / 1000000;
-    buf.timestamp.tv_usec = (bufhdr->nTimeStamp % 1000000);
-
-    if (!handle_input_extradata(buf)) {
-        DEBUG_PRINT_ERROR("%s Failed to handle input extradata", __func__);
-        return false;
-    }
-    VIDC_TRACE_INT_LOW("ETB-TS", bufhdr->nTimeStamp / 1000);
-
-    if (bufhdr->nFlags & OMX_BUFFERFLAG_EOS)
-        buf.flags |= V4L2_QCOM_BUF_FLAG_EOS;
-
-    if (!plane[0].bytesused) {
-        if (buf.flags & V4L2_QCOM_BUF_FLAG_EOS) {
-            DEBUG_PRINT_ERROR("venc_empty_buf: Zero length EOS buffers are not valid");
-            DEBUG_PRINT_ERROR("Use this function instead : venc_handle_empty_eos_buffer");
-            return false;
-        }
-        DEBUG_PRINT_ERROR("venc_empty_buf: Zero length buffers are not valid");
-        return false;
-    }
-
-    if (m_debug.in_buffer_log) {
-        venc_input_log_buffers(bufhdr, fd, plane[0].data_offset, m_sVenc_cfg.inputformat, interlace_flag);
-    }
-    if (m_debug.extradata_log && extra_idx && (extra_idx < VIDEO_MAX_PLANES)) {
-        DEBUG_PRINT_ERROR("Extradata Addr 0x%llx, Buffer Addr = 0x%x", (OMX_U64)input_extradata_info.uaddr, (unsigned int)plane[extra_idx].m.userptr);
-        venc_extradata_log_buffers((char *)plane[extra_idx].m.userptr, true);
-    }
-    rc = ioctl(m_nDriver_fd, VIDIOC_QBUF, &buf);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to qbuf (etb) to driver");
-        return false;
-    }
-
-    etb++;
 
     if (!streaming[OUTPUT_PORT]) {
         enum v4l2_buf_type buf_type;
         buf_type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         int ret;
+
+        // Some 3rd APPs use NativeRecorder to implement their applications
+        // like screenrecorder, implicitly enable B-frame may cause issues.
+        // So disallow implicit B-frame when input format is non-UBWC or RGBA(c2d enabled).
+        if ((m_sVenc_cfg.inputformat != V4L2_PIX_FMT_NV12_TP10_UBWC &&
+             m_sVenc_cfg.inputformat != V4L2_PIX_FMT_NV12_UBWC) || c2d_enabled) {
+            DEBUG_PRINT_HIGH("Disallow implicitly enable B-frames");
+            if (!set_native_recoder(OMX_FALSE)) {
+                DEBUG_PRINT_ERROR("Failed to set Native Recorder");
+                return false;
+            }
+        }
+
+        venc_set_quality_boost((OMX_BOOL)c2d_enabled);
 
         if (!downscalar_enabled) {
             OMX_U32 inp_width = 0, inp_height = 0, out_width = 0, out_height = 0;
@@ -4688,7 +3014,104 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
         }
     }
 
+    extra_idx = EXTRADATA_IDX(num_input_planes);
+
+    if (extra_idx && (extra_idx < VIDEO_MAX_PLANES)) {
+        plane[extra_idx].bytesused = input_extradata_info.buffer_size;
+        plane[extra_idx].length = input_extradata_info.buffer_size;
+        plane[extra_idx].m.userptr = (unsigned long)input_extradata_info.ion[index].uaddr;
+#ifdef USE_ION
+        plane[extra_idx].reserved[MSM_VIDC_BUFFER_FD] = input_extradata_info.ion[index].data_fd;
+#endif
+        plane[extra_idx].reserved[MSM_VIDC_DATA_OFFSET] = 0;
+        plane[extra_idx].data_offset = 0;
+    } else if (extra_idx >= VIDEO_MAX_PLANES) {
+        DEBUG_PRINT_ERROR("Extradata index higher than expected: %d\n", extra_idx);
+        return false;
+    }
+
+    buf.index = index;
+    buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    buf.memory = V4L2_MEMORY_USERPTR;
+    plane[0].reserved[MSM_VIDC_BUFFER_FD] = fd;
+    plane[0].reserved[MSM_VIDC_DATA_OFFSET] = 0;
+    buf.m.planes = plane;
+    buf.length = num_input_planes;
+    buf.timestamp.tv_sec = bufhdr->nTimeStamp / 1000000;
+    buf.timestamp.tv_usec = (bufhdr->nTimeStamp % 1000000);
+
+    if (!handle_input_extradata(buf)) {
+        DEBUG_PRINT_ERROR("%s Failed to handle input extradata", __func__);
+        return false;
+    }
+
+    VIDC_TRACE_INT_LOW("ETB-TS", bufhdr->nTimeStamp / 1000);
+
+    if (bufhdr->nFlags & OMX_BUFFERFLAG_EOS)
+        buf.flags |= V4L2_BUF_FLAG_EOS;
+
+    if (!plane[0].bytesused) {
+        if (buf.flags & V4L2_BUF_FLAG_EOS) {
+            DEBUG_PRINT_ERROR("venc_empty_buf: Zero length EOS buffers are not valid");
+            DEBUG_PRINT_ERROR("Use this function instead : venc_handle_empty_eos_buffer");
+            return false;
+        }
+        DEBUG_PRINT_ERROR("venc_empty_buf: Zero length buffers are not valid");
+        return false;
+    }
+
+    if (m_debug.in_buffer_log) {
+        venc_input_log_buffers(bufhdr, fd, plane[0].data_offset, m_sVenc_cfg.inputformat, interlace_flag);
+    }
+    if (m_debug.extradata_log && extra_idx && (extra_idx < VIDEO_MAX_PLANES)) {
+        DEBUG_PRINT_ERROR("Extradata Addr 0x%llx, Buffer Addr = 0x%x",
+            (OMX_U64)input_extradata_info.ion[index].uaddr, (unsigned int)plane[index].m.userptr);
+        venc_extradata_log_buffers((char *)plane[extra_idx].m.userptr, index, true);
+    }
+    print_v4l2_buffer("QBUF-ETB", &buf);
+    rc = ioctl(m_nDriver_fd, VIDIOC_QBUF, &buf);
+
+    if (rc) {
+        DEBUG_PRINT_ERROR("Failed to qbuf (etb) to driver");
+        return false;
+    }
+
+    etb++;
+
     return true;
+}
+
+unsigned long venc_dev::get_media_colorformat(unsigned long inputformat)
+{
+    unsigned long color_format;
+    switch (inputformat) {
+        case V4L2_PIX_FMT_NV12:
+            color_format = COLOR_FMT_NV12;
+            break;
+        case V4L2_PIX_FMT_NV12_512:
+            color_format = COLOR_FMT_NV12_512;
+            break;
+        case V4L2_PIX_FMT_NV12_UBWC:
+            color_format = COLOR_FMT_NV12_UBWC;
+            break;
+        case V4L2_PIX_FMT_RGB32:
+            color_format = COLOR_FMT_RGBA8888;
+            break;
+        case V4L2_PIX_FMT_RGBA8888_UBWC:
+            color_format = COLOR_FMT_RGBA8888_UBWC;
+            break;
+        case V4L2_PIX_FMT_SDE_Y_CBCR_H2V2_P010_VENUS:
+            color_format = COLOR_FMT_P010;
+            break;
+        case V4L2_PIX_FMT_NV12_TP10_UBWC:
+            color_format = COLOR_FMT_NV12_BPP10_UBWC;
+            break;
+        default:
+            color_format = COLOR_FMT_NV12_UBWC;
+            DEBUG_PRINT_ERROR("Unknown format %lx,default to NV12_UBWC", inputformat);
+            break;
+    }
+    return color_format;
 }
 
 bool venc_dev::venc_empty_batch(OMX_BUFFERHEADERTYPE *bufhdr, unsigned index)
@@ -4759,8 +3182,8 @@ bool venc_dev::venc_empty_batch(OMX_BUFFERHEADERTYPE *bufhdr, unsigned index)
             buf.index = (unsigned)v4l2Id;
             buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
             buf.memory = V4L2_MEMORY_USERPTR;
-            plane[0].reserved[0] = MetaBufferUtil::getFdAt(hnd, i);
-            plane[0].reserved[1] = 0;
+            plane[0].reserved[MSM_VIDC_BUFFER_FD] = MetaBufferUtil::getFdAt(hnd, i);
+            plane[0].reserved[MSM_VIDC_DATA_OFFSET] = 0;
             plane[0].data_offset = MetaBufferUtil::getIntAt(hnd, i, MetaBufferUtil::INT_OFFSET);
             plane[0].m.userptr = (unsigned long)meta_buf;
             plane[0].length = plane[0].bytesused = MetaBufferUtil::getIntAt(hnd, i, MetaBufferUtil::INT_SIZE);
@@ -4773,18 +3196,11 @@ bool venc_dev::venc_empty_batch(OMX_BUFFERHEADERTYPE *bufhdr, unsigned index)
             extra_idx = EXTRADATA_IDX(num_input_planes);
 
             if (extra_idx && (extra_idx < VIDEO_MAX_PLANES)) {
-                int fd = plane[0].reserved[0];
-                OMX_U32 extradata_index;
-                if (!venc_get_index_from_fd(fd, &extradata_index)) {
-                    return false;
-                }
-
-                plane[extra_idx].bytesused = 0;
-                plane[extra_idx].length = input_extradata_info.size;
-                plane[extra_idx].m.userptr = (unsigned long) (input_extradata_info.uaddr + extradata_index * input_extradata_info.buffer_size);
-                plane[extra_idx].reserved[0] = input_extradata_info.ion.data_fd;
-                plane[extra_idx].reserved[1] = input_extradata_info.buffer_size * extradata_index;
-                plane[extra_idx].reserved[2] = input_extradata_info.size;
+                plane[extra_idx].bytesused = input_extradata_info.buffer_size;
+                plane[extra_idx].length = input_extradata_info.buffer_size;
+                plane[extra_idx].m.userptr = (unsigned long)input_extradata_info.ion[v4l2Id].uaddr;
+                plane[extra_idx].reserved[MSM_VIDC_BUFFER_FD] = input_extradata_info.ion[v4l2Id].data_fd;
+                plane[extra_idx].reserved[MSM_VIDC_DATA_OFFSET] = 0;
                 plane[extra_idx].data_offset = 0;
             } else if (extra_idx >= VIDEO_MAX_PLANES) {
                 DEBUG_PRINT_ERROR("Extradata index higher than expected: %d\n", extra_idx);
@@ -4792,19 +3208,13 @@ bool venc_dev::venc_empty_batch(OMX_BUFFERHEADERTYPE *bufhdr, unsigned index)
             }
 
             if (bufhdr->nFlags & OMX_BUFFERFLAG_EOS)
-                buf.flags |= V4L2_QCOM_BUF_FLAG_EOS;
-#if NEED_TO_REVISIT
-            if (i != numBufs - 1) {
-                buf.flags |= V4L2_MSM_BUF_FLAG_DEFER;
-                DEBUG_PRINT_LOW("for buffer %d (etb #%d) in batch of %d, marking as defer",
-                        i, etb + 1, numBufs);
-            }
-#endif
+                buf.flags |= V4L2_BUF_FLAG_EOS;
+
             // timestamp differences from camera are in nano-seconds
             bufTimeStamp = bufhdr->nTimeStamp + MetaBufferUtil::getIntAt(hnd, i, MetaBufferUtil::INT_TIMESTAMP) / 1000;
 
             DEBUG_PRINT_LOW(" Q Batch [%d of %d] : buf=%p fd=%d len=%d TS=%lld",
-                i, numBufs, bufhdr, plane[0].reserved[0], plane[0].length, bufTimeStamp);
+                i, numBufs, bufhdr, plane[0].reserved[MSM_VIDC_BUFFER_FD], plane[0].length, bufTimeStamp);
             buf.timestamp.tv_sec = bufTimeStamp / 1000000;
             buf.timestamp.tv_usec = (bufTimeStamp % 1000000);
 
@@ -4812,8 +3222,15 @@ bool venc_dev::venc_empty_batch(OMX_BUFFERHEADERTYPE *bufhdr, unsigned index)
                 DEBUG_PRINT_ERROR("%s Failed to handle input extradata", __func__);
                 return false;
             }
+
+            if (!handle_dynamic_config(bufhdr)) {
+                DEBUG_PRINT_ERROR("%s Failed to set dynamic configs", __func__);
+                return false;
+            }
+
             VIDC_TRACE_INT_LOW("ETB-TS", bufTimeStamp / 1000);
 
+            print_v4l2_buffer("QBUF-ETB", &buf);
             rc = ioctl(m_nDriver_fd, VIDIOC_QBUF, &buf);
             if (rc) {
                 DEBUG_PRINT_ERROR("%s: Failed to qbuf (etb) to driver", __func__);
@@ -4893,8 +3310,8 @@ bool venc_dev::venc_fill_buf(void *buffer, void *pmem_data_buf,unsigned index,un
     buf.memory = V4L2_MEMORY_USERPTR;
     plane[0].length = bufhdr->nAllocLen;
     plane[0].bytesused = bufhdr->nFilledLen;
-    plane[0].reserved[0] = fd;
-    plane[0].reserved[1] = 0;
+    plane[0].reserved[MSM_VIDC_BUFFER_FD] = fd;
+    plane[0].reserved[MSM_VIDC_DATA_OFFSET] = 0;
     plane[0].data_offset = bufhdr->nOffset;
     buf.m.planes = plane;
     buf.length = num_output_planes;
@@ -4911,34 +3328,23 @@ bool venc_dev::venc_fill_buf(void *buffer, void *pmem_data_buf,unsigned index,un
         }
     }
 
-    if (mBatchSize) {
-        // Should always mark first buffer as DEFER, since 0 % anything is 0, just offset by 1
-        // This results in the first batch being of size mBatchSize + 1, but thats good because
-        // we need an extra FTB for the codec specific data.
-#if NEED_TO_REVISIT
-        if (!ftb || ftb % mBatchSize) {
-            buf.flags |= V4L2_MSM_BUF_FLAG_DEFER;
-            DEBUG_PRINT_LOW("for ftb buffer %d marking as defer", ftb + 1);
-        }
-#endif
-    }
-
     extra_idx = EXTRADATA_IDX(num_output_planes);
 
     if (extra_idx && (extra_idx < VIDEO_MAX_PLANES)) {
-        plane[extra_idx].bytesused = 0;
+        plane[extra_idx].bytesused = output_extradata_info.buffer_size;
         plane[extra_idx].length = output_extradata_info.buffer_size;
-        plane[extra_idx].m.userptr = (unsigned long) (output_extradata_info.uaddr + index * output_extradata_info.buffer_size);
+        plane[extra_idx].m.userptr = (unsigned long)output_extradata_info.ion[index].uaddr;
 #ifdef USE_ION
-        plane[extra_idx].reserved[0] = output_extradata_info.ion.data_fd;
+        plane[extra_idx].reserved[MSM_VIDC_BUFFER_FD] = output_extradata_info.ion[index].data_fd;
 #endif
-        plane[extra_idx].reserved[1] = output_extradata_info.buffer_size * index;
+        plane[extra_idx].reserved[MSM_VIDC_DATA_OFFSET] = 0;
         plane[extra_idx].data_offset = 0;
     } else if (extra_idx >= VIDEO_MAX_PLANES) {
         DEBUG_PRINT_ERROR("Extradata index higher than expected: %d", extra_idx);
         return false;
     }
 
+    print_v4l2_buffer("QBUF-FTB", &buf);
     rc = ioctl(m_nDriver_fd, VIDIOC_QBUF, &buf);
 
     if (rc) {
@@ -4947,135 +3353,6 @@ bool venc_dev::venc_fill_buf(void *buffer, void *pmem_data_buf,unsigned index,un
     }
 
     ftb++;
-    return true;
-}
-
-bool venc_dev::venc_set_inband_video_header(OMX_BOOL enable)
-{
-    struct v4l2_control control;
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_TME) {
-        return false;
-    }
-
-    control.id = V4L2_CID_MPEG_VIDEO_HEADER_MODE;
-    if(enable) {
-        control.value = V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME;
-    } else {
-        control.value = V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE;
-    }
-
-    DEBUG_PRINT_HIGH("Set inband sps/pps: %d", enable);
-    if(ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control) < 0) {
-        DEBUG_PRINT_ERROR("Request for inband sps/pps failed");
-        return false;
-    }
-    return true;
-}
-
-bool venc_dev::venc_set_au_delimiter(OMX_BOOL enable)
-{
-    struct v4l2_control control;
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_AU_DELIMITER;
-    if(enable) {
-        control.value = V4L2_MPEG_MSM_VIDC_ENABLE;
-    } else {
-        control.value = V4L2_MPEG_MSM_VIDC_DISABLE;
-    }
-
-    DEBUG_PRINT_HIGH("Set AU delimiters: %d", enable);
-    if(ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control) < 0) {
-        DEBUG_PRINT_ERROR("Request for AU delimiters failed");
-        return false;
-    }
-    return true;
-}
-
-bool venc_dev::venc_get_index_from_fd(OMX_U32 buffer_fd, OMX_U32 *index)
-{
-    for (unsigned int i = 0; i < (sizeof(fd_list)/sizeof(fd_list[0])); i++) {
-        if (fd_list[i] == buffer_fd) {
-            DEBUG_PRINT_HIGH("FD : %d found at index = %d", buffer_fd, i);
-            *index = i;
-            return true;
-        }
-    }
-
-    for (unsigned int i = 0; i < (sizeof(fd_list)/sizeof(fd_list[0])); i++) {
-        if (fd_list[i] == 0) {
-            DEBUG_PRINT_HIGH("FD : %d added at index = %d", buffer_fd, i);
-            fd_list[i] = buffer_fd;
-            *index = i;
-            return true;
-        }
-    }
-    DEBUG_PRINT_ERROR("Couldn't get index from fd : %d",buffer_fd);
-    return false;
-}
-
-bool venc_dev::venc_set_extradata(OMX_U32 extra_data, OMX_BOOL enable)
-{
-    struct v4l2_control control;
-
-    DEBUG_PRINT_HIGH("venc_set_extradata:: %x", (int) extra_data);
-
-    if (enable == OMX_FALSE) {
-        /* No easy way to turn off extradata to the driver
-         * at the moment */
-        return false;
-    }
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_EXTRADATA;
-    switch (extra_data) {
-        case OMX_ExtraDataVideoLTRInfo:
-            control.value = V4L2_MPEG_VIDC_EXTRADATA_LTR;
-            break;
-#ifdef V4L2_MPEG_VIDC_EXTRADATA_INPUT_CROP
-        case OMX_ExtraDataFrameDimension:
-            control.value = V4L2_MPEG_VIDC_EXTRADATA_INPUT_CROP;
-            break;
-#endif
-        default:
-            DEBUG_PRINT_ERROR("Unrecognized extradata index 0x%x", (unsigned int)extra_data);
-            return false;
-    }
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("ERROR: Request for setting extradata (%x) failed %d",
-                (unsigned int)extra_data, errno);
-        return false;
-    }
-
-    return true;
-}
-
-bool venc_dev::venc_set_slice_delivery_mode(OMX_U32 enable)
-{
-    struct v4l2_control control;
-
-    if (enable) {
-        control.id = V4L2_CID_MPEG_VIDEO_MULTI_SLICE_DELIVERY_MODE;
-        control.value = 1;
-        DEBUG_PRINT_LOW("Set slice_delivery_mode: %d", control.value);
-
-        if (multislice.mslice_mode == V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_MB && m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) {
-            if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-                DEBUG_PRINT_ERROR("Request for setting slice delivery mode failed");
-                return false;
-            } else {
-                DEBUG_PRINT_LOW("Successfully set Slice delivery mode id: %d, value=%d", control.id, control.value);
-                slice_mode.enable = 1;
-            }
-        } else {
-            DEBUG_PRINT_ERROR("Failed to set slice delivery mode, slice_mode [%lu] "
-                    "is not MB BASED or [%lu] is not H264 codec ", multislice.mslice_mode,
-                    m_sVenc_cfg.codectype);
-        }
-    } else {
-        DEBUG_PRINT_ERROR("Slice_DELIVERY_MODE not enabled");
-    }
-
     return true;
 }
 
@@ -5156,135 +3433,89 @@ bool venc_dev::venc_set_qp(OMX_U32 i_frame_qp, OMX_U32 p_frame_qp,OMX_U32 b_fram
     int rc;
     struct v4l2_control control;
 
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_I_FRAME_QP;
-    control.value = i_frame_qp;
+    OMX_U32 ids[3] = {
+        V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
+        V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP,
+        V4L2_CID_MPEG_VIDEO_HEVC_B_FRAME_QP
+    };
 
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
+    OMX_U32 qp_values[3] = {
+        i_frame_qp,
+        p_frame_qp,
+        b_frame_qp
+    };
+    unsigned long *session_qp_values[3] = {
+        &session_qp.iframeqp,
+        &session_qp.pframeqp,
+        &session_qp.bframeqp
+    };
+    OMX_U32 qp_mask[3] = {
+        ENABLE_I_QP,
+        ENABLE_P_QP,
+        ENABLE_B_QP
+    };
+
+    for(int i=0; i<3; i++) {
+        if (enable & qp_mask[i]) {
+            control.id = ids[i];
+            control.value = qp_values[i];
+
+            DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
+            rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
+
+            if (rc) {
+                DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
+                return false;
+            }
+            DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
+            *session_qp_values[i] = control.value;
+        }
+    }
+
+    return true;
+}
+
+bool venc_dev::set_nP_frames(unsigned long nPframes)
+{
+    struct v4l2_control control;
+
+    control.id = V4L2_CID_MPEG_VIDEO_GOP_SIZE;
+    control.value = (nPframes > VENC_INFINITE_GOP) ? VENC_INFINITE_GOP : nPframes;
+    int rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
 
     if (rc) {
         DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
         return false;
     }
     DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    session_qp.iframeqp = control.value;
 
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_P_FRAME_QP;
-    control.value = p_frame_qp;
+    return true;
+}
 
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
+bool venc_dev::set_nB_frames(unsigned long nBframes)
+{
+    struct v4l2_control control;
+
+    control.id = V4L2_CID_MPEG_VIDEO_B_FRAMES;
+    control.value = (nBframes > VENC_INFINITE_GOP) ? VENC_INFINITE_GOP : nBframes;
+    int rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
 
     if (rc) {
         DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
         return false;
     }
     DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    session_qp.pframeqp = control.value;
 
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_B_FRAME_QP;
-    control.value = b_frame_qp;
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
+    return true;
+}
 
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    session_qp.bframeqp = control.value;
+bool venc_dev::set_native_recoder(bool enable)
+{
+    struct v4l2_control control;
 
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_QP_MASK;
+    control.id = V4L2_CID_MPEG_VIDC_VENC_NATIVE_RECORDER;
     control.value = enable;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    session_qp.enableqp = control.value;
-
-    return true;
-}
-
-bool venc_dev::venc_set_session_qp_range(OMX_QCOM_VIDEO_PARAM_IPB_QPRANGETYPE* qp_range)
-{
-    int rc;
-    struct v4l2_ext_control ctrl[7];
-    struct v4l2_ext_controls controls;
-
-    ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_LAYER_ID;
-    ctrl[0].value = MSM_VIDC_ALL_LAYER_ID;
-
-    ctrl[1].id = V4L2_CID_MPEG_VIDC_VIDEO_I_FRAME_QP_MIN;
-    ctrl[1].value = qp_range->minIQP;
-
-    ctrl[2].id = V4L2_CID_MPEG_VIDC_VIDEO_I_FRAME_QP_MAX;
-    ctrl[2].value = qp_range->maxIQP;
-
-    ctrl[3].id = V4L2_CID_MPEG_VIDC_VIDEO_P_FRAME_QP_MIN;
-    ctrl[3].value = qp_range->minPQP;
-
-    ctrl[4].id = V4L2_CID_MPEG_VIDC_VIDEO_P_FRAME_QP_MAX;
-    ctrl[4].value = qp_range->maxPQP;
-
-    ctrl[5].id = V4L2_CID_MPEG_VIDC_VIDEO_B_FRAME_QP_MIN;
-    ctrl[5].value = qp_range->minBQP;
-
-    ctrl[6].id = V4L2_CID_MPEG_VIDC_VIDEO_B_FRAME_QP_MAX;
-    ctrl[6].value = qp_range->maxBQP;
-
-    controls.count = 7;
-    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-    controls.controls = ctrl;
-
-    if(ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls)) {
-        DEBUG_PRINT_ERROR("Failed to set QP range");
-            return false;
-    }
-
-    session_ipb_qp_values.min_i_qp = qp_range->minIQP;
-    session_ipb_qp_values.max_i_qp = qp_range->maxIQP;
-    session_ipb_qp_values.min_p_qp = qp_range->minPQP;
-    session_ipb_qp_values.max_p_qp = qp_range->maxPQP;
-    session_ipb_qp_values.min_b_qp = qp_range->minBQP;
-    session_ipb_qp_values.max_b_qp = qp_range->maxBQP;
-    return true;
-}
-
-bool venc_dev::venc_set_profile(OMX_U32 eProfile)
-{
-    int rc;
-    struct v4l2_control control;
-
-    DEBUG_PRINT_LOW("venc_set_profile:: eProfile = %u",
-            (unsigned int)eProfile);
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) {
-        control.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
-    } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8) {
-        //In driver VP8 profile is hardcoded. No need to set anything from here
-        return true;
-    } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_HEVC_PROFILE;
-    } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_TME) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_TME_PROFILE;
-    } else {
-        DEBUG_PRINT_ERROR("Wrong CODEC");
-        return false;
-    }
-
-    if (!profile_level_converter::convert_omx_profile_to_v4l2(m_sVenc_cfg.codectype, eProfile, &control.value)) {
-        DEBUG_PRINT_ERROR("Cannot find v4l2 profile for OMX profile : %d Codec : %lu ",
-                          eProfile, m_sVenc_cfg.codectype);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
+    int rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
 
     if (rc) {
         DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
@@ -5292,574 +3523,35 @@ bool venc_dev::venc_set_profile(OMX_U32 eProfile)
     }
     DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
 
-    codec_profile.profile = control.value;
-
-    if (hdr10metadata_supported == true && (!is_hevcprofile_explicitly_set)) {
-        if (venc_set_extradata_hdr10metadata() == false)
-        {
-            DEBUG_PRINT_ERROR("Failed to set extradata HDR10PLUS_METADATA");
-            return false;
-        }
-    }
     return true;
-}
-
-bool venc_dev::venc_set_level(OMX_U32 eLevel)
-{
-    int rc;
-    struct v4l2_control control;
-
-    DEBUG_PRINT_LOW("venc_set_level:: eLevel = %u",
-                    (unsigned int)eLevel);
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) {
-        control.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL;
-        control.value = V4L2_MPEG_VIDEO_H264_LEVEL_UNKNOWN;
-    } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_VP8_PROFILE_LEVEL;
-        control.value = V4L2_MPEG_VIDC_VIDEO_VP8_UNUSED;
-    } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_HEVC_TIER_LEVEL;
-        control.value = V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_UNKNOWN;
-    } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_TME) {
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_TME_LEVEL;
-        control.value = V4L2_MPEG_VIDC_VIDEO_TME_LEVEL_INTEGER;
-    } else {
-        DEBUG_PRINT_ERROR("Wrong CODEC");
-        return false;
-    }
-
-    /* If OMX_VIDEO_LEVEL_UNKNOWN then set default values assigned above  */
-    if (eLevel != OMX_VIDEO_LEVEL_UNKNOWN) {
-        if (!profile_level_converter::convert_omx_level_to_v4l2(m_sVenc_cfg.codectype, eLevel, &control.value)) {
-            DEBUG_PRINT_LOW("Warning: Cannot find v4l2 level for OMX level : %d Codec : %lu Setting unknown level",
-                              eLevel, m_sVenc_cfg.codectype);
-        }
-    }
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    profile_level.level = control.value;
-
-    return true;
-}
-
-bool venc_dev::venc_set_voptiming_cfg( OMX_U32 TimeIncRes)
-{
-
-    struct venc_voptimingcfg vop_timing_cfg;
-
-    DEBUG_PRINT_LOW("venc_set_voptiming_cfg: TimeRes = %u",
-            (unsigned int)TimeIncRes);
-
-    vop_timing_cfg.voptime_resolution = TimeIncRes;
-
-    voptimecfg.voptime_resolution = vop_timing_cfg.voptime_resolution;
-    return true;
-}
-
-bool venc_dev::venc_reconfigure_intra_refresh_period() {
-
-    DEBUG_PRINT_LOW("venc_reconfigure_intra_refresh_period");
-    if (intra_refresh.framecount) {
-        OMX_U32 mb_size = 16;
-        // Firmware will re-calculate mbcount if codec is HEVC.
-        OMX_U32 num_mbs_per_frame = (ALIGN(m_sVenc_cfg.dvs_height, mb_size)/mb_size) * (ALIGN(m_sVenc_cfg.dvs_width, mb_size)/mb_size);
-        OMX_U32 num_intra_refresh_mbs = 0;
-        num_intra_refresh_mbs = ceil(num_mbs_per_frame / intra_refresh.framecount);
-
-        intra_refresh.irmode     = OMX_VIDEO_IntraRefreshRandom;
-        intra_refresh.mbcount    = num_intra_refresh_mbs;
-    }
-
-    if (venc_set_intra_refresh() == false) {
-        DEBUG_PRINT_ERROR("ERROR: Setting Intra refresh failed");
-        return false;
-    }
-
-    return true;
-}
-
-bool venc_dev::venc_reconfigure_intra_period()
-{
-    int  rc;
-    bool isValidCodec        = false;
-    bool isValidResolution   = false;
-    bool isValidFps          = false;
-    bool isValidOpRate       = false;
-    bool isValidLayerCount   = false;
-    bool enableBframes       = false;
-    bool isValidLtrSetting   = false;
-    bool isValidRcMode       = false;
-    struct v4l2_control control;
-
-    DEBUG_PRINT_LOW("venc_reconfigure_intra_period");
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264 &&
-        ((codec_profile.profile == V4L2_MPEG_VIDEO_H264_PROFILE_MAIN) ||
-         (codec_profile.profile == V4L2_MPEG_VIDEO_H264_PROFILE_HIGH))) {
-        isValidCodec = true;
-    }
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC &&
-        ((codec_profile.profile == V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN) ||
-         (codec_profile.profile == V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN10) ||
-         (codec_profile.profile == V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN_STILL_PIC)) &&
-         (m_codec != OMX_VIDEO_CodingImageHEIC)) {
-        isValidCodec = true;
-    }
-
-    if ((m_sVenc_cfg.input_width <= VENC_BFRAME_MAX_WIDTH && m_sVenc_cfg.input_height <= VENC_BFRAME_MAX_HEIGHT) ||
-        (m_sVenc_cfg.input_width <= VENC_BFRAME_MAX_HEIGHT && m_sVenc_cfg.input_height <= VENC_BFRAME_MAX_WIDTH)) {
-        isValidResolution = true;
-    }
-
-    if ((m_sVenc_cfg.fps_num / m_sVenc_cfg.fps_den) <= VENC_BFRAME_MAX_FPS) {
-        isValidFps = true;
-    }
-
-    if (operating_rate <= VENC_BFRAME_MAX_FPS) {
-        isValidOpRate = true;
-    }
-
-    if (temporal_layers_config.nPLayers <= 1) {
-        isValidLayerCount = true;
-    }
-
-    if (rate_ctrl.rcmode == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR) {
-        isValidRcMode = true;
-    }
-
-    isValidLtrSetting = ltrinfo.enabled ? false : true;
-
-    enableBframes = isValidResolution   &&
-                    isValidFps          &&
-                    isValidOpRate       &&
-                    isValidLayerCount   &&
-                    isValidLtrSetting   &&
-                    isValidRcMode       &&
-                    isValidCodec        &&
-                    !low_latency_mode   &&
-                    !client_req_disable_bframe;
-
-    DEBUG_PRINT_LOW("B-frame enablement = %u; Conditions for Resolution = %u, FPS = %u,"
-                     "Operating rate = %u, Layer condition = %u, LTR = %u, RC = %u"
-                     "Codec/Profile = %u Client request to disable = %u LowLatency : %u \n isNativeRecorder : %u",
-                     enableBframes, isValidResolution, isValidFps, isValidOpRate,
-                     isValidLayerCount, isValidLtrSetting, isValidRcMode, isValidCodec, client_req_disable_bframe,
-                     low_latency_mode, mIsNativeRecorder);
-
-    if (enableBframes && intra_period.num_bframes == 0 && intra_period.num_pframes > VENC_BFRAME_MAX_COUNT
-            && mIsNativeRecorder) {
-        intra_period.num_bframes = VENC_BFRAME_MAX_COUNT;
-        nPframes_cache = intra_period.num_pframes;
-        intra_period.num_pframes = intra_period.num_pframes / (1 + intra_period.num_bframes);
-        bframe_implicitly_enabled = true;
-    } else if (!enableBframes && intra_period.num_bframes > 0) {
-        intra_period.num_pframes = intra_period.num_pframes + (intra_period.num_pframes * intra_period.num_bframes);
-        intra_period.num_bframes = 0;
-    }
-
-    if (!venc_calibrate_gop())
-    {
-        DEBUG_PRINT_ERROR("Invalid settings, Hybrid HP enabled with LTR OR Hier-pLayers OR bframes");
-        return false;
-    }
-
-    control.id    = V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES;
-    control.value = intra_period.num_pframes;
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES");
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES value=%d", control.value);
-
-    control.id    = V4L2_CID_MPEG_VIDC_VIDEO_NUM_B_FRAMES;
-    control.value = intra_period.num_bframes;
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control V4L2_CID_MPEG_VIDC_VIDEO_NUM_B_FRAMES");
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for V4L2_CID_MPEG_VIDC_VIDEO_NUM_B_FRAMES value=%lu", intra_period.num_bframes);
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264 ||
-        m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
-        /*
-         * This call is to ensure default idr period is set if client
-         * did not set it using index OMX_IndexConfigVideoAVCIntraPeriod.
-         */
-        if (venc_set_idr_period(idrperiod.idrperiod) == false) {
-            DEBUG_PRINT_ERROR("ERROR: Setting idr period failed");
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool venc_dev::venc_set_grid_enable()
-{
-    int rc;
-    struct v4l2_control control;
-
-    DEBUG_PRINT_LOW("venc_set_grid_enable");
-    control.id = V4L2_CID_MPEG_VIDC_IMG_GRID_ENABLE;
-    control.value = 1;
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    mIsGridset = true;
-    return true;
-}
-
-bool venc_dev::venc_set_intra_period(OMX_U32 nPFrames, OMX_U32 nBFrames)
-{
-    DEBUG_PRINT_LOW("venc_set_intra_period: nPFrames = %u, nBFrames: %u", (unsigned int)nPFrames, (unsigned int)nBFrames);
-
-    if ((streaming[OUTPUT_PORT] || streaming[CAPTURE_PORT]) && (intra_period.num_bframes != nBFrames)) {
-        DEBUG_PRINT_ERROR("Invalid settings, Cannot change B frame count dynamically");
-        return false;
-    }
-    return _venc_set_intra_period(nPFrames, nBFrames);
-}
-
-bool venc_dev::_venc_set_intra_period(OMX_U32 nPFrames, OMX_U32 nBFrames)
-{
-    int rc;
-    struct v4l2_control control;
-    char property_value[PROPERTY_VALUE_MAX] = {0};
-
-    if ((m_sVenc_cfg.codectype != V4L2_PIX_FMT_H264 &&
-        m_sVenc_cfg.codectype != V4L2_PIX_FMT_HEVC) ||
-        m_codec == OMX_VIDEO_CodingImageHEIC) {
-        nBFrames = 0;
-    }
-
-    if ((codec_profile.profile != V4L2_MPEG_VIDEO_MPEG4_PROFILE_ADVANCED_SIMPLE) &&
-        (codec_profile.profile != V4L2_MPEG_VIDEO_H264_PROFILE_MAIN)             &&
-        (codec_profile.profile != V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN)        &&
-        (codec_profile.profile != V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN10)      &&
-        (codec_profile.profile != V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN_STILL_PIC) &&
-        (codec_profile.profile != V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)) {
-        nBFrames = 0;
-    }
-
-    if (temporal_layers_config.nPLayers > 1 && nBFrames) {
-        DEBUG_PRINT_ERROR("Invalid settings, bframes cannot be enabled with HP. Resetting it to 0");
-        nBFrames = 0;
-    }
-
-    if (nBFrames > VENC_BFRAME_MAX_COUNT) {
-        DEBUG_PRINT_LOW("Hardware doesn't support %u bframes, Continuing with Max supported count 1", nBFrames);
-        nBFrames = VENC_BFRAME_MAX_COUNT;
-    }
-
-    intra_period.num_pframes = nPFrames;
-    intra_period.num_bframes = nBFrames;
-
-    if (!venc_calibrate_gop())
-    {
-        DEBUG_PRINT_ERROR("Invalid settings, Hybrid HP enabled with LTR OR Hier-pLayers OR bframes");
-        return false;
-    }
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES;
-    control.value = intra_period.num_pframes;
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_B_FRAMES;
-    control.value = intra_period.num_bframes;
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    return true;
-}
-
-bool venc_dev::venc_set_idr_period(OMX_U32 nIDRPeriod)
-{
-    int rc = 0;
-    struct v4l2_control control;
-
-    if (m_sVenc_cfg.codectype != V4L2_PIX_FMT_H264 &&
-        m_sVenc_cfg.codectype != V4L2_PIX_FMT_HEVC) {
-        // don't return error if idr period is zero even though invalid codectype
-        if (!nIDRPeriod)
-            return true;
-
-        DEBUG_PRINT_ERROR("venc_set_idr_period: invalid codedtype (%#lx)",
-            m_sVenc_cfg.codectype);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("venc_set_idr_period: nIDRPeriod: %u", (unsigned int)nIDRPeriod);
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_IDR_PERIOD;
-    control.value = nIDRPeriod;
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-    idrperiod.idrperiod = nIDRPeriod;
-
-    return true;
-}
-
-bool venc_dev::venc_set_entropy_config(OMX_BOOL enable, OMX_U32 i_cabac_level)
-{
-    int rc = 0;
-    struct v4l2_control control;
-
-    DEBUG_PRINT_LOW("venc_set_entropy_config: CABAC = %u level: %u", enable, (unsigned int)i_cabac_level);
-
-    if (enable && (codec_profile.profile != V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE) &&
-            (codec_profile.profile != V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE)) {
-        control.value = V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC;
-    } else if (!enable) {
-        control.value =  V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC;
-    } else {
-        DEBUG_PRINT_ERROR("Invalid Entropy mode for Baseline Profile");
-        return false;
-    }
-
-    control.id = V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    entropy.longentropysel = control.value;
-
-    return true;
-}
-
-bool venc_dev::venc_set_multislice_cfg(OMX_U32 nSlicemode, OMX_U32 nSlicesize)
-{
-    int rc;
-    int slice_id = 0;
-    struct v4l2_control control;
-    bool status = true;
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_H263 || nSlicesize == 0) {
-        nSlicemode = V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_SINGLE;
-        nSlicesize = 0;
-    }
-
-    if (nSlicemode == V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_MB) {
-        if (!venc_validate_range(V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB, nSlicesize)) {
-            DEBUG_PRINT_ERROR("Invalid settings, hardware doesn't support %u as slicesize", nSlicesize);
-            return false;
-        }
-        slice_id = V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB;
-
-    } else if (nSlicemode == V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_BYTES) {
-        if (!venc_validate_range(V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_BYTES, nSlicesize)) {
-            DEBUG_PRINT_ERROR("Invalid settings, hardware doesn't support %u as slicesize", nSlicesize);
-            return false;
-        }
-        slice_id = V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_BYTES;
-
-    } else if (nSlicesize) {
-        DEBUG_PRINT_ERROR("Invalid settings, unexpected slicemode = %u and slice size = %u", nSlicemode, nSlicesize);
-        return false;
-    }
-
-    control.id    = V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE;
-    control.value = nSlicemode;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    if (nSlicemode == V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_SINGLE) {
-        return status;
-    }
-
-    control.id    = slice_id;
-    control.value = nSlicesize;
-
-    DEBUG_PRINT_LOW("Calling SLICE_MB IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control");
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    multislice.mslice_mode = nSlicemode;
-    multislice.mslice_size = nSlicesize;
-
-    return status;
 }
 
 bool venc_dev::venc_set_intra_refresh()
 {
-    bool status = true;
     int rc;
     struct v4l2_control control_mode;
-    control_mode.id   = V4L2_CID_MPEG_VIDC_VIDEO_INTRA_REFRESH_MODE_CYCLIC;
-    control_mode.value = 0;
-    // There is no disabled mode.  Disabled mode is indicated by a 0 count.
-    if (intra_refresh.irmode == OMX_VIDEO_IntraRefreshMax || intra_refresh.mbcount == 0) {
-        return status;
-    } else if (intra_refresh.irmode == OMX_VIDEO_IntraRefreshCyclic ||
-               intra_refresh.irmode == OMX_VIDEO_IntraRefreshRandom) {
+
+    // Default is RANDOM mode
+    control_mode.id = V4L2_CID_MPEG_VIDC_VIDEO_INTRA_REFRESH_RANDOM;
+    // Set intra refresh period (frame count) for Random mode
+    control_mode.value  = intra_refresh.framecount;
+
+    if (intra_refresh.irmode == OMX_VIDEO_IntraRefreshCyclic) {
+        control_mode.id = V4L2_CID_MPEG_VIDEO_CYCLIC_INTRA_REFRESH_MB;
         control_mode.value  = intra_refresh.mbcount;
-    } else {
-        DEBUG_PRINT_ERROR("ERROR: Invalid IntraRefresh Parameters:"
-                " mb mode:%lu", intra_refresh.irmode);
-        return false;
     }
 
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%u, val=%d", control_mode.id, control_mode.value);
+    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%u, val=%d",
+                    control_mode.id, control_mode.value);
     rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control_mode);
 
     if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control_mode.id, control_mode.value);
-        return false;
+        DEBUG_PRINT_HIGH("Failed to set control, id %#x, value %d",
+                         control_mode.id, control_mode.value);
+        // This key is ignored if the video encoder does not support the intra refresh feature.
+        // From android developer reference documentation.
     }
 
-    return status;
-}
-
-bool venc_dev::venc_set_error_resilience(OMX_VIDEO_PARAM_ERRORCORRECTIONTYPE* error_resilience)
-{
-    bool status = true;
-    struct venc_headerextension hec_cfg;
-    struct venc_multiclicecfg multislice_cfg;
-    int rc;
-    OMX_U32 resynchMarkerSpacingBytes = 0;
-    struct v4l2_control control;
-
-    memset(&control, 0, sizeof(control));
-
-    if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_MPEG4) {
-        if (error_resilience->bEnableHEC) {
-            hec_cfg.header_extension = 1;
-        } else {
-            hec_cfg.header_extension = 0;
-        }
-
-        hec.header_extension = error_resilience->bEnableHEC;
-    }
-
-    if (error_resilience->bEnableRVLC) {
-        DEBUG_PRINT_ERROR("RVLC is not Supported");
-        return false;
-    }
-
-    if (( m_sVenc_cfg.codectype != V4L2_PIX_FMT_H263) &&
-            (error_resilience->bEnableDataPartitioning)) {
-        DEBUG_PRINT_ERROR("DataPartioning are not Supported for MPEG4/H264");
-        return false;
-    }
-
-    if (error_resilience->nResynchMarkerSpacing) {
-        resynchMarkerSpacingBytes = error_resilience->nResynchMarkerSpacing;
-        resynchMarkerSpacingBytes = ALIGN(resynchMarkerSpacingBytes, 8) >> 3;
-    }
-
-    status = venc_set_multislice_cfg(V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_BYTES, resynchMarkerSpacingBytes);
-
-    return status;
-}
-
-bool venc_dev::venc_set_inloop_filter(OMX_VIDEO_AVCLOOPFILTERTYPE loopfilter)
-{
-    int rc;
-    struct v4l2_control control;
-    control.id=V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE;
-    control.value=0;
-
-    if (loopfilter == OMX_VIDEO_AVCLoopFilterEnable) {
-        control.value=V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED;
-    } else if (loopfilter == OMX_VIDEO_AVCLoopFilterDisable) {
-        control.value=V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED;
-    } else if (loopfilter == OMX_VIDEO_AVCLoopFilterDisableSliceBoundary) {
-        control.value=V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY;
-    }
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    dbkfilter.db_mode=control.value;
-
-    control.id=V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_ALPHA;
-    control.value=0;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    control.id=V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_BETA;
-    control.value=0;
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-
-    dbkfilter.slicealpha_offset = dbkfilter.slicebeta_offset = 0;
     return true;
 }
 
@@ -5869,16 +3561,12 @@ bool venc_dev::venc_set_target_bitrate(OMX_U32 nTargetBitrate)
             (unsigned int)nTargetBitrate);
     struct v4l2_control control;
     int rc = 0;
+    OMX_U32 ids[2] = {
+        V4L2_CID_MPEG_VIDC_COMPRESSION_QUALITY,
+        V4L2_CID_MPEG_VIDEO_BITRATE
+    };
 
-    if (vqzip_sei_info.enabled) {
-        DEBUG_PRINT_HIGH("For VQZIP 1.0, Bitrate setting is not supported");
-        return true;
-    }
-
-    if (rate_ctrl.rcmode == V4L2_MPEG_VIDEO_BITRATE_MODE_CQ)
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_FRAME_QUALITY;
-    else
-        control.id = V4L2_CID_MPEG_VIDEO_BITRATE;
+    control.id =  ids[!!(rate_ctrl.rcmode ^ V4L2_MPEG_VIDEO_BITRATE_MODE_CQ)];
     control.value = nTargetBitrate;
 
     DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
@@ -5888,94 +3576,33 @@ bool venc_dev::venc_set_target_bitrate(OMX_U32 nTargetBitrate)
         return false;
     }
 
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    if (control.id == V4L2_CID_MPEG_VIDC_VIDEO_FRAME_QUALITY)
-        return true;
-
-    m_sVenc_cfg.targetbitrate = control.value;
     bitrate.target_bitrate = control.value;
-
-    // Configure layer-wise bitrate if temporal layers are enabled and layer-wise distribution
-    //  has been specified
-    if (temporal_layers_config.bIsBitrateRatioValid && temporal_layers_config.nPLayers) {
-        OMX_U32 layerBitrates[OMX_VIDEO_MAX_HP_LAYERS] = {0},
-                numLayers = temporal_layers_config.nPLayers + temporal_layers_config.nBLayers;
-
-        DEBUG_PRINT_LOW("TemporalLayer: configuring layerwise bitrate");
-        for (OMX_U32 i = 0; i < numLayers; ++i) {
-            layerBitrates[i] =
-                    (temporal_layers_config.nTemporalLayerBitrateFraction[i] * bitrate.target_bitrate) / 100;
-            DEBUG_PRINT_LOW("TemporalLayer: layer[%u] ratio=%u%% bitrate=%u(of %ld)",
-                    i, temporal_layers_config.nTemporalLayerBitrateFraction[i],
-                    layerBitrates[i], bitrate.target_bitrate);
-        }
-        if (!venc_set_layer_bitrates((OMX_U32 *)layerBitrates, numLayers)) {
-            return false;
-        }
-    }
+    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
 
     return true;
 }
 
 bool venc_dev::venc_set_encode_framerate(OMX_U32 encode_framerate)
 {
-    struct v4l2_streamparm parm;
     int rc = 0;
     struct venc_framerate frame_rate_cfg;
-    Q16ToFraction(encode_framerate,frame_rate_cfg.fps_numerator,frame_rate_cfg.fps_denominator);
-    parm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    parm.parm.output.timeperframe.numerator = frame_rate_cfg.fps_denominator;
-    parm.parm.output.timeperframe.denominator = frame_rate_cfg.fps_numerator;
+    struct v4l2_control control;
 
-    if (vqzip_sei_info.enabled) {
-        DEBUG_PRINT_HIGH("For VQZIP 1.0, Framerate setting is not supported");
-        return true;
-    }
+    control.id =  V4L2_CID_MPEG_VIDC_VIDEO_FRAME_RATE;
+    control.value = encode_framerate;
 
-
-    if (frame_rate_cfg.fps_numerator > 0)
-        rc = ioctl(m_nDriver_fd, VIDIOC_S_PARM, &parm);
-
+    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
+    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
     if (rc) {
-        DEBUG_PRINT_ERROR("ERROR: Request for setting framerate failed");
+        DEBUG_PRINT_ERROR("Failed to set control, id %#x, value %d", control.id, control.value);
         return false;
     }
 
+    Q16ToFraction(encode_framerate,frame_rate_cfg.fps_numerator,frame_rate_cfg.fps_denominator);
     m_sVenc_cfg.fps_den = frame_rate_cfg.fps_denominator;
     m_sVenc_cfg.fps_num = frame_rate_cfg.fps_numerator;
 
     return true;
-}
-
-unsigned long venc_dev::venc_get_codectype(OMX_VIDEO_CODINGTYPE eCompressionFormat)
-{
-    unsigned long codectype = V4L2_PIX_FMT_H264;
-
-    switch ((int)eCompressionFormat) {
-    case OMX_VIDEO_CodingAVC:
-        codectype = V4L2_PIX_FMT_H264;
-        break;
-    case OMX_VIDEO_CodingVP8:
-        codectype = V4L2_PIX_FMT_VP8;
-        break;
-    case OMX_VIDEO_CodingVP9:
-        codectype = V4L2_PIX_FMT_VP9;
-        break;
-    case OMX_VIDEO_CodingHEVC:
-    case OMX_VIDEO_CodingImageHEIC:
-        codectype = V4L2_PIX_FMT_HEVC;
-        break;
-    case QOMX_VIDEO_CodingTME:
-        codectype = V4L2_PIX_FMT_TME;
-        break;
-    default:
-        DEBUG_PRINT_ERROR("Unsupported eCompressionFormat %#x", eCompressionFormat);
-        codectype = V4L2_PIX_FMT_H264;
-        break;
-    }
-
-    return codectype;
 }
 
 unsigned long venc_dev::venc_get_color_format(OMX_COLOR_FORMATTYPE eColorFormat)
@@ -6082,7 +3709,7 @@ bool venc_dev::venc_set_intra_vop_refresh(OMX_BOOL intra_vop_refresh)
     if (intra_vop_refresh == OMX_TRUE) {
         struct v4l2_control control;
         int rc;
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_REQUEST_IFRAME;
+        control.id = V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
         control.value = 1;
 
         rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
@@ -6098,180 +3725,56 @@ bool venc_dev::venc_set_intra_vop_refresh(OMX_BOOL intra_vop_refresh)
     return true;
 }
 
-bool venc_dev::venc_calibrate_gop()
+OMX_ERRORTYPE venc_dev::venc_set_max_hierp_layer()
 {
-    int ratio, sub_gop_size, gop_size, nPframes, nBframes, nLayers;
-    int num_sub_gops_in_a_gop;
-    nPframes = intra_period.num_pframes;
-    nBframes = intra_period.num_bframes;
-    nLayers = temporal_layers_config.nPLayers + temporal_layers_config.nBLayers;
-
-    if (!nPframes && nLayers) {
-        DEBUG_PRINT_ERROR("nPframes should be non-zero when nLayers are present\n");
-        return false;
-    }
-
-   /* if (nBframes && !nPframes) {
-        DEBUG_PRINT_ERROR("nPframes should be non-zero when nBframes is non-zero\n");
-        return false;
-    }*/
-
-    if (nLayers > 1) { /*Multi-layer encoding*/
-        sub_gop_size = 1 << (nLayers - 1);
-        /* Actual GOP definition is nPframes + nBframes + 1 but for the sake of
-         * below calculations we are ignoring +1 . Ignoring +1 in below
-         * calculations is not a mistake but intentional.
-         */
-        gop_size = MAX(sub_gop_size, ROUND(nPframes + (nPframes * nBframes), sub_gop_size));
-        num_sub_gops_in_a_gop = gop_size/sub_gop_size;
-        if (nBframes) { /*Hier-B case*/
-        /*
-            * Frame Type--> I  B  B  B  P  B  B  B  P  I  B  B  P ...
-            * Layer -->     0  2  1  2  0  2  1  2  0  0  2  1  2 ...
-            * nPframes = 2, nBframes = 3, nLayers = 3
-            *
-            * Intention is to keep the intraperiod as close as possible to what is desired
-            * by the client while adjusting nPframes and nBframes to meet other constraints.
-            * eg1: Input by client: nPframes =  9, nBframes = 14, nLayers = 2
-            *    Output of this fn: nPframes = 12, nBframes = 12, nLayers = 2
-            *
-            * eg2: Input by client: nPframes = 9, nBframes = 4, nLayers = 2
-            *    Output of this fn: nPframes = 7, nBframes = 7, nLayers = 2
-            */
-            nPframes = num_sub_gops_in_a_gop;
-            nBframes = sub_gop_size - 1;
-        } else { /*Hier-P case*/
-            /*
-            * Frame Type--> I  P  P  P  P  P  P  P  I  P  P  P  P ...
-            * Layer-->      0  2  1  2  0  2  1  2  0  2  1  2  0 ...
-            * nPframes =  7, nBframes = 0, nLayers = 3
-            *
-            * Intention is to keep the intraperiod as close as possible to what is desired
-            * by the client while adjusting nPframes and nBframes to meet other constraints.
-            * eg1: Input by client: nPframes = 9, nBframes = 0, nLayers = 3
-            *    Output of this fn: nPframes = 7, nBframes = 0, nLayers = 3
-            *
-            * eg2: Input by client: nPframes = 10, nBframes = 0, nLayers = 3
-            *     Output of this fn:nPframes = 12, nBframes = 0, nLayers = 3
-            */
-            nPframes = gop_size - 1;
-        }
-    } else { /*Single-layer encoding*/
-            /*
-            * No special handling needed for single layer
-            */
-       DEBUG_PRINT_LOW("Clip num of P and B frames, nPframes: %d nBframes: %d",
-                       nPframes,nBframes);
-       if ((unsigned int)nPframes > VENC_INFINITE_GOP) {
-          nPframes =  VENC_INFINITE_GOP;
-       }
-       if ((unsigned int)nBframes > VENC_INFINITE_GOP) {
-          nBframes =  VENC_INFINITE_GOP;
-       }
-    }
-
-    DEBUG_PRINT_LOW("P/B Frames changed from: %ld/%ld to %d/%d",
-        intra_period.num_pframes, intra_period.num_bframes, nPframes, nBframes);
-    intra_period.num_pframes = nPframes;
-    intra_period.num_bframes = nBframes;
-    return true;
-}
-
-bool venc_dev::venc_set_bitrate_type(OMX_U32 type)
-{
+    DEBUG_PRINT_LOW("venc_set_max_hierp_layer");
     struct v4l2_control control;
-    int rc = 0;
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_VENC_BITRATE_TYPE;
-    control.value = type;
-    DEBUG_PRINT_LOW("Set Bitrate type to %s for %d \n", bitrate_type_string(type), type);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Request to set Bitrate type to %s failed",
-            bitrate_type_string(type));
-        return false;
+
+    DEBUG_PRINT_LOW("Setting hierp max layer: %u",
+                    temporal_layers_config.nMaxLayers);
+
+    control.id = V4L2_CID_MPEG_VIDC_VIDEO_HEVC_MAX_HIER_CODING_LAYER;
+    control.value = temporal_layers_config.nMaxLayers;
+
+    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
+        DEBUG_PRINT_ERROR("Failed to set max HP layers: %u", control.value);
+        return OMX_ErrorUnsupportedSetting;
     }
-    return true;
+    return OMX_ErrorNone;
 }
 
-bool venc_dev::venc_set_layer_bitrates(OMX_U32 *layerBitrate, OMX_U32 numLayers)
+OMX_ERRORTYPE venc_dev::venc_set_hierp_layer()
 {
-    DEBUG_PRINT_LOW("venc_set_layer_bitrates");
-    struct v4l2_ext_control ctrl[2];
-    struct v4l2_ext_controls controls;
-    int rc = 0;
-    OMX_U32 i;
+    DEBUG_PRINT_LOW("venc_set_hierp_layer");
+    struct v4l2_control control;
 
-    if (!venc_set_bitrate_type(V4L2_MPEG_MSM_VIDC_ENABLE)) {
-        DEBUG_PRINT_ERROR("Failed to set layerwise bitrate type %d", rc);
-        return false;
+    DEBUG_PRINT_LOW("Setting hierp layer: %u", temporal_layers_config.nPLayers);
+
+    control.id = V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_LAYER;
+    control.value = temporal_layers_config.nPLayers;
+
+    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
+        DEBUG_PRINT_ERROR("Failed to set HP layers: %u", control.value);
+        return OMX_ErrorUnsupportedSetting;
     }
-
-    for (OMX_U32 i = 0; i < numLayers && i < OMX_VIDEO_ANDROID_MAXTEMPORALLAYERS; ++i) {
-        if (!layerBitrate[i]) {
-            DEBUG_PRINT_ERROR("Invalid bitrate settings for layer %d", i);
-            return false;
-        } else {
-            ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_LAYER_ID;
-            ctrl[0].value = i;
-            ctrl[1].id = V4L2_CID_MPEG_VIDC_VENC_PARAM_LAYER_BITRATE;
-            ctrl[1].value = layerBitrate[i];
-
-            controls.count = 2;
-            controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-            controls.controls = ctrl;
-
-            rc = ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls);
-            if (rc) {
-                DEBUG_PRINT_ERROR("Failed to set layerwise bitrate %d", rc);
-                return false;
-            }
-
-            DEBUG_PRINT_LOW("Layerwise bitrate configured successfully for layer : %u bitrate : %u ",i, layerBitrate[i]);
-        }
-    }
-    return true;
+    return OMX_ErrorNone;
 }
 
-
-bool venc_dev::venc_set_ltrmode(OMX_U32 enable, OMX_U32 count)
+bool venc_dev::venc_set_ltrcount(OMX_U32 count)
 {
-    DEBUG_PRINT_LOW("venc_set_ltrmode: enable = %u", (unsigned int)enable);
-    struct v4l2_ext_control ctrl[2];
-    struct v4l2_ext_controls controls;
-    int rc;
+    DEBUG_PRINT_LOW("venc_set_ltrcount: count = %u", (unsigned int)count);
+    struct v4l2_control control;
 
-    if (enable && temporal_layers_config.hier_mode == HIER_P_HYBRID) {
-        DEBUG_PRINT_ERROR("Invalid settings, LTR is being enabled with HybridHP");
-        return false;
+    control.id = V4L2_CID_MPEG_VIDC_VIDEO_LTRCOUNT;
+    control.value = count;
+
+    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
+        DEBUG_PRINT_ERROR("Failed to set LTR count: %u", control.value);
+        return OMX_ErrorUnsupportedSetting;
     }
 
-    ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_LTRCOUNT;
-    if (enable && count > 0)
-        ctrl[0].value = count;
-    else if (enable)
-        ctrl[0].value = 1;
-    else
-        ctrl[0].value = 0;
-
-    controls.count = 1;
-    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-    controls.controls = ctrl;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%x, val=%d id=%x, val=%d",
-                    controls.controls[0].id, controls.controls[0].value,
-                    controls.controls[1].id, controls.controls[1].value);
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set ltrmode %d", rc);
-        return false;
-    }
-    ltrinfo.enabled = enable;
-    ltrinfo.count = count;
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%x, val=%d id=%x, val=%d",
-                    controls.controls[0].id, controls.controls[0].value,
-                    controls.controls[1].id, controls.controls[1].value);
+    DEBUG_PRINT_LOW("Success IOCTL set control for id=%x, val=%d",
+                    control.id, control.value);
     return true;
 }
 
@@ -6306,7 +3809,7 @@ bool venc_dev::venc_set_markltr(OMX_U32 frameIdx)
 
     rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
     if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set ltrmode %d", rc);
+        DEBUG_PRINT_ERROR("Failed to set markltr %d", rc);
         return false;
     }
 
@@ -6315,23 +3818,34 @@ bool venc_dev::venc_set_markltr(OMX_U32 frameIdx)
     return true;
 }
 
-bool venc_dev::venc_set_mirror(OMX_U32 mirror)
+bool venc_dev::venc_set_mirror(OMX_MIRRORTYPE mirror)
 {
     DEBUG_PRINT_LOW("venc_set_mirror");
     int rc = true;
-    struct v4l2_control control;
+    struct v4l2_control control[2];
 
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_FLIP;
-    control.value = mirror;
+    control[0].id = V4L2_CID_VFLIP;
+    control[0].value = V4L2_MPEG_MSM_VIDC_DISABLE;
+    control[1].id = V4L2_CID_HFLIP;
+    control[1].value = V4L2_MPEG_MSM_VIDC_DISABLE;
 
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set mirror %d", rc);
-        return false;
+    if (mirror == OMX_MirrorVertical || mirror == OMX_MirrorBoth) {
+        control[0].value = V4L2_MPEG_MSM_VIDC_ENABLE;
+    }
+    if (mirror == OMX_MirrorHorizontal || mirror == OMX_MirrorBoth) {
+        control[1].value = V4L2_MPEG_MSM_VIDC_ENABLE;
     }
 
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%x, val=%d",
-                    control.id, control.value);
+    for(int i=0; i<2; i++) {
+        rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control[i]);
+        if (rc) {
+            DEBUG_PRINT_ERROR("Failed to set mirror %d", rc);
+            return false;
+        }
+        DEBUG_PRINT_LOW("Success IOCTL set control for id=%x, val=%d",
+                        control[i].id, control[i].value);
+    }
+
     return true;
 }
 
@@ -6365,234 +3879,68 @@ bool venc_dev::venc_set_vpe_rotation(OMX_S32 rotation_angle)
     return true;
 }
 
-bool venc_dev::venc_set_searchrange()
+bool venc_dev::venc_prepare_c2d_rotation(OMX_S32 rotation_angle)
 {
-    DEBUG_PRINT_LOW("venc_set_searchrange");
-    struct v4l2_control control;
-    struct v4l2_ext_control ctrl[6];
-    struct v4l2_ext_controls controls;
-    int rc;
+   int rc;
+   struct v4l2_format fmt;
+   struct v4l2_requestbuffers bufreq;
+   OMX_PARAM_PORTDEFINITIONTYPE *portDefn;
 
-    if ((m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) ||
-               (m_sVenc_cfg.codectype == V4L2_PIX_FMT_VP8)) {
-        ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_X_RANGE;
-        ctrl[0].value = 16;
-        ctrl[1].id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_Y_RANGE;
-        ctrl[1].value = 4;
-        ctrl[2].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_X_RANGE;
-        ctrl[2].value = 16;
-        ctrl[3].id = V4L2_CID_MPEG_VIDC_VIDEO_PFRAME_Y_RANGE;
-        ctrl[3].value = 4;
-        ctrl[4].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_X_RANGE;
-        ctrl[4].value = 12;
-        ctrl[5].id = V4L2_CID_MPEG_VIDC_VIDEO_BFRAME_Y_RANGE;
-        ctrl[5].value = 4;
-    } else {
-        DEBUG_PRINT_ERROR("Invalid codec type");
-        return false;
-    }
-    controls.count = 6;
-    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-    controls.controls = ctrl;
-
-    DEBUG_PRINT_LOW(" Calling IOCTL set control for"
-        "id=%x, val=%d id=%x, val=%d"
-        "id=%x, val=%d id=%x, val=%d"
-        "id=%x, val=%d id=%x, val=%d",
-        controls.controls[0].id, controls.controls[0].value,
-        controls.controls[1].id, controls.controls[1].value,
-        controls.controls[2].id, controls.controls[2].value,
-        controls.controls[3].id, controls.controls[3].value,
-        controls.controls[4].id, controls.controls[4].value,
-        controls.controls[5].id, controls.controls[5].value);
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set search range %d", rc);
-        return false;
-    }
-    return true;
-}
-
-bool venc_dev::venc_set_ratectrl_cfg(OMX_VIDEO_CONTROLRATETYPE eControlRate)
-{
-    bool status = true;
-    struct v4l2_control control;
-    int rc = 0;
-    control.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
-
-    int temp = eControlRate;
-    switch ((OMX_U32)eControlRate) {
-        case OMX_Video_ControlRateDisable:
-            control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_RC_OFF;
-            break;
-        case OMX_Video_ControlRateVariableSkipFrames:
-            (supported_rc_modes & RC_VBR_VFR) ?
-                control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR :
-                status = false;
-            break;
-        case OMX_Video_ControlRateVariable:
-            (supported_rc_modes & RC_VBR_CFR) ?
-                control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR :
-                status = false;
-            break;
-        case OMX_Video_ControlRateConstantSkipFrames:
-            (supported_rc_modes & RC_CBR_VFR) ?
-                control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR_VFR :
-                status = false;
-            break;
-        case OMX_Video_ControlRateConstant:
-            (supported_rc_modes & RC_CBR_CFR) ?
-                control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR :
-                status = false;
-            break;
-        case QOMX_Video_ControlRateMaxBitrate:
-            (supported_rc_modes & RC_MBR_CFR) ?
-                control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_MBR:
-                status = false;
-            break;
-        case QOMX_Video_ControlRateMaxBitrateSkipFrames:
-            (supported_rc_modes & RC_MBR_VFR) ?
-                control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_MBR_VFR:
-                status = false;
-            break;
-        case OMX_Video_ControlRateConstantQuality:
-            (supported_rc_modes & RC_CQ) ?
-                control.value = V4L2_MPEG_VIDEO_BITRATE_MODE_CQ:
-                status = false;
-            break;
-        default:
-            status = false;
-            break;
+    DEBUG_PRINT_HIGH("venc_prepare_c2d_rotation angle = %d", (int)rotation_angle);
+    if ((OMX_S32)m_rotation.rotation == rotation_angle) {
+        DEBUG_PRINT_HIGH("venc_prepare_c2d_rotation: rotation (%d) not changed", rotation_angle);
+        return true;
     }
 
-    if (status) {
+    if (rotation_angle == 90 || rotation_angle == 270) {
+        m_bDimensionsNeedFlip = true;
+        portDefn = &venc_handle->m_sInPortDef;
+        m_sVenc_cfg.input_height = portDefn->format.video.nFrameWidth;
+        m_sVenc_cfg.input_width =  portDefn->format.video.nFrameHeight;
 
-        DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-        rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
+        memset(&fmt, 0, sizeof(fmt));
 
-        if (rc) {
-            DEBUG_PRINT_ERROR("Failed to set control");
+        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        if (ioctl(m_nDriver_fd, VIDIOC_G_FMT, &fmt)) {
+            DEBUG_PRINT_ERROR("Failed to get format on OUTPUT_MPLANE");
             return false;
         }
 
-        DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-        rate_ctrl.rcmode = control.value;
-    }
-
-    {
-        DEBUG_PRINT_LOW("Set bitrate savings %d", mBitrateSavingsEnable);
-        control.id = V4L2_CID_MPEG_VIDC_VENC_BITRATE_SAVINGS;
-        control.value = mBitrateSavingsEnable;
-        rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-        if (rc) {
-            DEBUG_PRINT_HIGH("Non-Fatal: Request to set bitrate savings failed");
+        fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
+        fmt.fmt.pix_mp.width = m_sVenc_cfg.input_width;
+        if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
+            DEBUG_PRINT_ERROR("set format failed, type %d, wxh %dx%d",
+                fmt.type, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height);
+                hw_overload = errno == EBUSY;
+                return false;
         }
-    }
+        m_sInput_buff_property.datasize=fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 
-#ifdef _VQZIP_
-    if (eControlRate == OMX_Video_ControlRateVariable && (supported_rc_modes & RC_VBR_CFR)
-            && m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) {
-        /* Enable VQZIP SEI by default for camcorder RC modes */
+        portDefn = &venc_handle->m_sOutPortDef;
+        m_sVenc_cfg.dvs_width  = portDefn->format.video.nFrameHeight;
+        m_sVenc_cfg.dvs_height = portDefn->format.video.nFrameWidth;
 
-        control.id = V4L2_CID_MPEG_VIDC_VIDEO_VQZIP_SEI;
-        control.value = V4L2_CID_MPEG_VIDC_VIDEO_VQZIP_SEI_ENABLE;
-        DEBUG_PRINT_HIGH("Set VQZIP SEI:");
-        if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control) < 0) {
-            DEBUG_PRINT_HIGH("Non-Fatal: Request to set VQZIP failed");
+        memset(&fmt, 0, sizeof(fmt));
+
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        if (ioctl(m_nDriver_fd, VIDIOC_G_FMT, &fmt)) {
+            DEBUG_PRINT_ERROR("Failed to get format on CAPTURE_MPLANE");
+            return false;
         }
-    }
-#endif
 
-    return status;
-}
+        fmt.fmt.pix_mp.height = m_sVenc_cfg.dvs_height;
+        fmt.fmt.pix_mp.width = m_sVenc_cfg.dvs_width;
+        if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
+            DEBUG_PRINT_ERROR("VIDIOC_S_FMT CAPTURE_MPLANE Failed");
+            hw_overload = errno == EBUSY;
+            return false;
+        }
 
-bool venc_dev::venc_set_aspectratio(void *nSar)
-{
-    int rc;
-    struct v4l2_control control;
-    struct v4l2_ext_control ctrl[2];
-    struct v4l2_ext_controls controls;
-    QOMX_EXTNINDEX_VIDEO_VENC_SAR *sar;
-
-    sar = (QOMX_EXTNINDEX_VIDEO_VENC_SAR *) nSar;
-
-    ctrl[0].id = V4L2_CID_MPEG_VIDC_VENC_PARAM_SAR_WIDTH;
-    ctrl[0].value = sar->nSARWidth;
-    ctrl[1].id = V4L2_CID_MPEG_VIDC_VENC_PARAM_SAR_HEIGHT;
-    ctrl[1].value = sar->nSARHeight;
-
-    controls.count = 2;
-    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-    controls.controls = ctrl;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%x val=%d, id=%x val=%d",
-                    controls.controls[0].id, controls.controls[0].value,
-                    controls.controls[1].id, controls.controls[1].value);
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set SAR %d", rc);
-        return false;
+        m_sOutput_buff_property.datasize = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
     }
 
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%x val=%d, id=%x val=%d",
-                    controls.controls[0].id, controls.controls[0].value,
-                    controls.controls[1].id, controls.controls[1].value);
-    return true;
-}
-
-bool venc_dev::venc_set_lowlatency_mode(OMX_BOOL enable)
-{
-    int rc = 0;
-    struct v4l2_control control;
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_LOWLATENCY_MODE;
-    if (enable)
-        control.value = V4L2_MPEG_MSM_VIDC_ENABLE;
-    else
-        control.value = V4L2_MPEG_MSM_VIDC_DISABLE;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%x, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set lowlatency control");
-        return false;
-    }
-    low_latency_mode = enable;
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%x, value=%d", control.id, control.value);
-
-    return true;
-}
-
-bool venc_dev::venc_set_iframesize_type(QOMX_VIDEO_IFRAMESIZE_TYPE type)
-{
-    struct v4l2_control control;
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_SIZE_TYPE;
-
-    switch (type) {
-        case QOMX_IFRAMESIZE_DEFAULT:
-            control.value = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_SIZE_DEFAULT;
-            break;
-        case QOMX_IFRAMESIZE_MEDIUM:
-            control.value = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_SIZE_MEDIUM;
-            break;
-        case QOMX_IFRAMESIZE_HUGE:
-            control.value = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_SIZE_HUGE;
-            break;
-        case QOMX_IFRAMESIZE_UNLIMITED:
-            control.value = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_SIZE_UNLIMITED;
-            break;
-        default:
-            DEBUG_PRINT_INFO("Unknown Iframe Size found setting it to default");
-            control.value = V4L2_CID_MPEG_VIDC_VIDEO_IFRAME_SIZE_DEFAULT;
-    }
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("Failed to set iframe size hint");
-        return false;
-    }
+    /* successfully set rotation_angle, save it */
+    m_rotation.rotation = rotation_angle;
 
     return true;
 }
@@ -6616,74 +3964,6 @@ bool venc_dev::venc_set_baselayerid(OMX_U32 baseid)
     }
 }
 
-bool venc_dev::venc_set_vui_timing_info(OMX_BOOL enable)
-{
-    struct v4l2_control control;
-    int rc = 0;
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_VUI_TIMING_INFO;
-
-    if (enable)
-        control.value = V4L2_MPEG_MSM_VIDC_ENABLE;
-    else
-        control.value = V4L2_MPEG_MSM_VIDC_DISABLE;
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%x, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set VUI timing info control");
-        return false;
-    }
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%x, value=%d", control.id, control.value);
-    return true;
-}
-
-bool venc_dev::venc_set_peak_bitrate(OMX_U32 nPeakBitrate)
-{
-    struct v4l2_control control;
-    int rc = 0;
-    control.id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK;
-    control.value = nPeakBitrate;
-
-    DEBUG_PRINT_LOW("venc_set_peak_bitrate: bitrate = %u", (unsigned int)nPeakBitrate);
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set peak bitrate control");
-        return false;
-    }
-
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-
-    return true;
-}
-
-bool venc_dev::venc_set_vpx_error_resilience(OMX_BOOL enable)
-{
-    struct v4l2_control control;
-    int rc = 0;
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_VPX_ERROR_RESILIENCE;
-
-    if (enable)
-        control.value = 1;
-    else
-        control.value = 0;
-
-    DEBUG_PRINT_LOW("venc_set_vpx_error_resilience: %d", control.value);
-
-    DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%d", control.id, control.value);
-
-    rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed to set VPX Error Resilience");
-        return false;
-    }
-    vpx_err_resilience.enable = 1;
-    DEBUG_PRINT_LOW("Success IOCTL set control for id=%d, value=%d", control.id, control.value);
-    return true;
-}
-
 bool venc_dev::venc_set_priority(OMX_U32 priority) {
     struct v4l2_control control;
 
@@ -6702,14 +3982,62 @@ bool venc_dev::venc_set_priority(OMX_U32 priority) {
     return true;
 }
 
+bool venc_dev::reconfigure_avc_param(OMX_VIDEO_PARAM_AVCTYPE *param) {
+    param->eProfile = (OMX_VIDEO_AVCPROFILETYPE)QOMX_VIDEO_AVCProfileMain;
+
+    DEBUG_PRINT_LOW("reconfigure_avc_param");
+
+    if (!venc_set_profile (param->eProfile)) {
+        DEBUG_PRINT_ERROR("ERROR: Unsuccessful in updating Profile %d",
+            param->eProfile);
+        return false;
+    }
+    if (set_nP_frames(param->nPFrames) == false ||
+        (param->nBFrames && set_nB_frames(param->nBFrames) == false)) {
+            DEBUG_PRINT_ERROR("ERROR: Request for setting intra period failed");
+            return false;
+    }
+    if (!venc_set_entropy_config (param->bEntropyCodingCABAC, param->nCabacInitIdc)) {
+        DEBUG_PRINT_ERROR("ERROR: Request for setting Entropy failed");
+        return false;
+    }
+    if (!venc_set_inloop_filter (param->eLoopFilterMode)) {
+        DEBUG_PRINT_ERROR("ERROR: Request for setting Inloop filter failed");
+        return false;
+    }
+    if (!venc_set_multislice_cfg(V4L2_MPEG_VIDEO_MULTI_SICE_MODE_MAX_MB, param->nSliceHeaderSpacing)) {
+        DEBUG_PRINT_ERROR("WARNING: Unsuccessful in updating slice_config");
+        return false;
+    }
+    if (!venc_h264_transform_8x8(param->bDirect8x8Inference)) {
+        DEBUG_PRINT_ERROR("WARNING: Request for setting Transform8x8 failed");
+        return false;
+    }
+
+    return true;
+}
+
 bool venc_dev::venc_set_operatingrate(OMX_U32 rate) {
     struct v4l2_control control;
 
     control.id = V4L2_CID_MPEG_VIDC_VIDEO_OPERATING_RATE;
     control.value = rate;
 
+    if (rate > INT_MAX)
+        control.value = INT_MAX;
+
     DEBUG_PRINT_LOW("venc_set_operating_rate: %u fps", rate >> 16);
     DEBUG_PRINT_LOW("Calling IOCTL set control for id=%d, val=%u", control.id, control.value);
+
+    if (!strncmp(venc_handle->m_platform, "bengal", 6) &&
+        (rate >> 16) > 30 && m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264 &&
+        venc_handle->m_sParamAVC.eProfile ==
+            (OMX_VIDEO_AVCPROFILETYPE)QOMX_VIDEO_AVCProfileHigh &&
+        (m_sVenc_cfg.input_width * m_sVenc_cfg.input_height >= 1920 * 1080)) {
+        if (!reconfigure_avc_param(&venc_handle->m_sParamAVC)) {
+            DEBUG_PRINT_ERROR("reconfigure avc param fails");
+        }
+    }
 
     if(ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
         hw_overload = errno == EBUSY;
@@ -6717,14 +4045,9 @@ bool venc_dev::venc_set_operatingrate(OMX_U32 rate) {
                 rate >> 16, hw_overload ? "HW overload" : strerror(errno));
         return false;
     }
-    if (rate == QOMX_VIDEO_HIGH_PERF_OPERATING_MODE) {
-        DEBUG_PRINT_LOW("Turbo mode requested");
-        client_req_turbo_mode = true;
-    } else {
-        operating_rate = rate >> 16;
-        client_req_turbo_mode = false;
-        DEBUG_PRINT_LOW("Operating Rate Set = %d fps",  rate >> 16);
-    }
+
+    operating_rate = rate >> 16;
+    DEBUG_PRINT_LOW("Operating Rate Set = %d fps",  rate >> 16);
 
     return true;
 }
@@ -6766,44 +4089,17 @@ bool venc_dev::venc_set_roi_qp_info(OMX_QTI_VIDEO_CONFIG_ROIINFO *roiInfo)
 
 bool venc_dev::venc_set_blur_resolution(OMX_QTI_VIDEO_CONFIG_BLURINFO *blurInfo)
 {
-    struct v4l2_ext_control ctrl[2];
-    struct v4l2_ext_controls controls;
+    struct v4l2_control ctrl;
 
-    int blur_width = 0, blur_height = 0;
+    ctrl.id = V4L2_CID_MPEG_VIDC_VIDEO_BLUR_DIMENSIONS;
+    ctrl.value = blurInfo->nBlurInfo;
 
-    switch (blurInfo->nBlurInfo) {
-        case 0:
-            blur_width = 0;
-            blur_height = 0;
-            [[fallthrough]];
-        case 1:
-            blur_width = 1;
-            blur_height = 1;
-            [[fallthrough]];
-        default:
-            blur_width = blurInfo->nBlurInfo >> 16;
-            blur_height = blurInfo->nBlurInfo & 0xFFFF;
-            DEBUG_PRINT_LOW("Custom blur resolution %ux%u", blur_width, blur_height);
-            break;
-    }
-
-    ctrl[0].id = V4L2_CID_MPEG_VIDC_VIDEO_BLUR_WIDTH;
-    ctrl[0].value = blur_width;
-
-    ctrl[1].id = V4L2_CID_MPEG_VIDC_VIDEO_BLUR_HEIGHT;
-    ctrl[1].value = blur_height;
-
-    controls.count = 2;
-    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-    controls.controls = ctrl;
-
-    if(ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls)) {
+    if(ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &ctrl)) {
         DEBUG_PRINT_ERROR("Failed to set blur resoltion");
         return false;
     }
-    DEBUG_PRINT_LOW("Blur resolution set = %u x %u", blur_width, blur_height);
-    return true;
 
+    return true;
 }
 
 bool venc_dev::venc_h264_transform_8x8(OMX_BOOL enable)
@@ -6827,6 +4123,8 @@ bool venc_dev::venc_h264_transform_8x8(OMX_BOOL enable)
 
 bool venc_dev::venc_get_temporal_layer_caps(OMX_U32 *nMaxLayers,
         OMX_U32 *nMaxBLayers, OMX_VIDEO_ANDROID_TEMPORALLAYERINGPATTERNTYPE *eSupportedPattern) {
+
+    (void) nMaxBLayers;
     struct v4l2_queryctrl query_ctrl;
 
     if(m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC || m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) {
@@ -6837,11 +4135,7 @@ bool venc_dev::venc_get_temporal_layer_caps(OMX_U32 *nMaxLayers,
         *eSupportedPattern = OMX_VIDEO_AndroidTemporalLayeringPatternNone;
     }
 
-    if(venc_check_for_hybrid_hp(*eSupportedPattern)) {
-        query_ctrl.id = V4L2_CID_MPEG_VIDC_VIDEO_HYBRID_HIERP_MODE;
-    } else {
-        query_ctrl.id = V4L2_CID_MPEG_VIDC_VIDEO_HIER_P_NUM_LAYERS;
-    }
+    query_ctrl.id = V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_LAYER;
 
     DEBUG_PRINT_LOW("TemporalLayer: Querying P layer caps");
     if (ioctl(m_nDriver_fd, VIDIOC_QUERYCTRL, &query_ctrl)) {
@@ -6852,400 +4146,40 @@ bool venc_dev::venc_get_temporal_layer_caps(OMX_U32 *nMaxLayers,
     //Return +1 as driver works on num max enhancement layers and OMX on num layers
     *nMaxLayers = query_ctrl.maximum + 1;
 
-    query_ctrl.id = V4L2_CID_MPEG_VIDC_VIDEO_HIER_B_NUM_LAYERS;
-    DEBUG_PRINT_LOW("TemporalLayer: Querying B layer caps");
-    if (ioctl(m_nDriver_fd, VIDIOC_QUERYCTRL, &query_ctrl)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Query control B layer caps faile");
-        return false;
-    }
-
-    *nMaxBLayers = query_ctrl.maximum;
     return true;
 }
 
-bool venc_dev::venc_check_for_hybrid_hp(OMX_VIDEO_ANDROID_TEMPORALLAYERINGPATTERNTYPE ePattern) {
-    //Hybrid HP is only for H264 and VBR CFR
-    if (m_sVenc_cfg.codectype != V4L2_PIX_FMT_H264) {
-        DEBUG_PRINT_LOW("TemporalLayer: Hybrid HierP is not supported for non H264");
-        return false;
-    }
+OMX_ERRORTYPE venc_dev::venc_set_bitrate_ratios()
+{
+    struct v4l2_control ctrl;
+    int rc = 0;
+    OMX_U32 ids[] = {
+        V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L0_BR,
+        V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L1_BR,
+        V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L2_BR,
+        V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L3_BR,
+        V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L4_BR,
+        V4L2_CID_MPEG_VIDEO_HEVC_HIER_CODING_L5_BR,
+    };
 
-    if (ePattern != OMX_VIDEO_AndroidTemporalLayeringPatternAndroid) {
-        DEBUG_PRINT_LOW("TemporalLayer: The pattern must be Android for Hybrid HP");
-        return false;
-    }
-    if (rate_ctrl.rcmode != V4L2_MPEG_VIDEO_BITRATE_MODE_VBR) {
-        DEBUG_PRINT_LOW("TemporalLayer: RC must be VBR CFR for HybridHP");
-        return false;
-    }
-    return true;
-}
+    DEBUG_PRINT_LOW("TemporalLayer: layerwise bitrate ratio");
 
-bool venc_dev::venc_check_for_hierp(OMX_VIDEO_ANDROID_TEMPORALLAYERINGPATTERNTYPE ePattern) {
+    // Set all bitrate ratios to kernel. If client hasn't set bitrate ratio
+    // for a layer, 0 is passed on to kernel.
+    for (OMX_U32 i = 0; i < (OMX_U32)(sizeof(ids)/sizeof(ids[0])); ++i) {
+        ctrl.id = ids[i];
+        ctrl.value = temporal_layers_config.nTemporalLayerBitrateRatio[i];
 
-    if (ePattern != OMX_VIDEO_AndroidTemporalLayeringPatternAndroid) {
-        DEBUG_PRINT_LOW("TemporalLayer: Incorrect Pattern for H264/HEVC");
-        return false;
-    }
-
-    return true;
-}
-
-int venc_dev::venc_find_hier_type(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE &temporal_settings) {
-
-    enum hier_type hier;
-
-    if (venc_check_for_hybrid_hp(temporal_settings.ePattern)) {
-        hier = HIER_P_HYBRID;
-    } else if (venc_check_for_hierp(temporal_settings.ePattern)) {
-        hier = HIER_P;
-    } else {
-        hier = HIER_NONE;
-    }
-
-    if (!venc_validate_temporal_extn(temporal_settings)) {
-        hier = HIER_NONE;
-    }
-
-    return hier;
-}
-
-OMX_ERRORTYPE venc_dev::venc_set_hp(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE &temporal_settings) {
-
-    struct v4l2_control control;
-    OMX_U32 maxLayerCount = 0;
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_MAX_HIERP_LAYERS;
-    control.value = temporal_settings.nLayerCountMax - 1;
-
-    DEBUG_PRINT_LOW("TemporalLayer: Setting HP with max layers: %u num layers : %u",
-                    temporal_settings.nLayerCountMax - 1,
-                    temporal_settings.nPLayerCountActual - 1);
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to set max HP layers to %u", control.value);
-        return OMX_ErrorUnsupportedSetting;
-    }
-
-    maxLayerCount = control.value + 1;
-
-    control.id = V4L2_CID_MPEG_VIDC_VIDEO_HIER_P_NUM_LAYERS;
-    control.value = temporal_settings.nPLayerCountActual - 1;
-    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to set hybrid hierp/hierp NumLayers : %u", control.value);
-        return OMX_ErrorUnsupportedSetting;
-    }
-
-    temporal_layers_config.ePattern     = temporal_settings.ePattern;
-    temporal_layers_config.hier_mode    = HIER_P;
-    temporal_layers_config.nPLayers     = control.value + 1;
-    temporal_layers_config.nMaxLayers   = maxLayerCount;
-    temporal_layers_config.nBLayers     = 0;
-    temporal_layers_config.nMaxBLayers  = 0;
-
-    return OMX_ErrorNone;
-}
-
-OMX_ERRORTYPE venc_dev::venc_set_hhp(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE &temporal_settings) {
-
-    struct v4l2_control control;
-
-    control.id      = V4L2_CID_MPEG_VIDC_VIDEO_HYBRID_HIERP_MODE;
-    control.value   = temporal_settings.nPLayerCountActual - 1;
-
-    DEBUG_PRINT_LOW("TemporalLayer: Setting HybridHP with num layers : %u", control.value);
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to set hybrid HP. Try HierP");
-        return OMX_ErrorUnsupportedSetting;
-    }
-
-    temporal_layers_config.ePattern     = temporal_settings.ePattern;
-    temporal_layers_config.hier_mode    = HIER_P_HYBRID;
-    temporal_layers_config.nPLayers     = control.value + 1;
-    temporal_layers_config.nMaxLayers   = control.value + 1;
-    temporal_layers_config.nBLayers     = 0;
-    temporal_layers_config.nMaxBLayers  = 0;
-    if (ltrinfo.enabled) {
-        if (!venc_set_ltrmode(0, 0)) {
-            DEBUG_PRINT_ERROR("TemporalLayer: Failed to disable LTR when HybridHP is enabled");
-            return OMX_ErrorUndefined;
-        }
-    }
-    return OMX_ErrorNone;
-}
-OMX_ERRORTYPE venc_dev::venc_disable_hhp() {
-
-    if (m_sVenc_cfg.codectype != V4L2_PIX_FMT_H264) {
-        return OMX_ErrorNone;
-    }
-
-    struct v4l2_control control;
-
-    control.id      = V4L2_CID_MPEG_VIDC_VIDEO_HYBRID_HIERP_MODE;
-    control.value   = 0;
-
-    if (ioctl(m_nDriver_fd, VIDIOC_G_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to get hybrid HP");
-        return OMX_ErrorUnsupportedSetting;
-    }
-
-    if (control.value != 0) {
-        control.value = 0;
-
-        DEBUG_PRINT_LOW("TemporalLayer: Disabling HybridHP");
-
-        if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-            DEBUG_PRINT_ERROR("TemporalLayer: Failed to disable hybrid HP");
+        rc = ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &ctrl);
+        if (rc) {
+            DEBUG_PRINT_ERROR("Failed to set layerwise bitrate ratio. Id= %u, Value= %u, error %d",
+                              ctrl.id, ctrl.value, rc);
             return OMX_ErrorUnsupportedSetting;
         }
+        DEBUG_PRINT_LOW("Layerwise bitrate configured successfully for layer: %u, bitrate: %u",
+                        i, temporal_layers_config.nTemporalLayerBitrateRatio[i]);
     }
-
-    return OMX_ErrorNone;
-}
-
-OMX_ERRORTYPE venc_dev::venc_disable_hp() {
-
-    struct v4l2_control control;
-
-    control.id      = V4L2_CID_MPEG_VIDC_VIDEO_MAX_HIERP_LAYERS;
-    control.value   = 0;
-
-    DEBUG_PRINT_LOW("TemporalLayer: Disabling HP");
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to reset max HP layers to %u", control.value);
-        return OMX_ErrorUnsupportedSetting;
-    }
-
-    control.id      = V4L2_CID_MPEG_VIDC_VIDEO_HIER_P_NUM_LAYERS;
-    control.value   = 0;
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to reset HP layers to %u", control.value);
-        return OMX_ErrorUnsupportedSetting;
-    }
-
-    return OMX_ErrorNone;
-}
-
-OMX_ERRORTYPE venc_dev::venc_set_bitrate_ratio(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE &temporal_settings) {
-
-    OMX_U32 layerBitrates[OMX_VIDEO_MAX_HP_LAYERS] = {0};
-    OMX_U32 numLayers = temporal_settings.nPLayerCountActual + temporal_settings.nBLayerCountActual;
-
-    if (temporal_settings.bBitrateRatiosSpecified == OMX_FALSE) {
-        DEBUG_PRINT_LOW("TemporalLayer: layerwise bitrate ratio not specified. Will use cumulative");
-
-        if (!venc_set_bitrate_type(V4L2_MPEG_MSM_VIDC_DISABLE)) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-        return OMX_ErrorNone;
-    }
-
-    DEBUG_PRINT_LOW("TemporalLayer: layerwise bitrate ratio specified");
-
-    for (OMX_U32 i = 0; i < numLayers; ++i) {
-        OMX_U32 previousLayersAccumulatedBitrateRatio = (i == 0) ? 0 : temporal_settings.nBitrateRatios[i-1];
-        OMX_U32 currentLayerBitrateRatio = temporal_settings.nBitrateRatios[i] - previousLayersAccumulatedBitrateRatio;
-        if (previousLayersAccumulatedBitrateRatio > temporal_settings.nBitrateRatios[i]) {
-            DEBUG_PRINT_ERROR("TemporalLayer: invalid bitrate ratio for layer %d.. Will fallback to cumulative", i);
-            return OMX_ErrorBadParameter;
-        } else {
-            layerBitrates[i] = (currentLayerBitrateRatio * bitrate.target_bitrate) / 100;
-            temporal_layers_config.nTemporalLayerBitrateRatio[i] = temporal_settings.nBitrateRatios[i];
-            temporal_layers_config.nTemporalLayerBitrateFraction[i] = currentLayerBitrateRatio;
-            DEBUG_PRINT_LOW("TemporalLayer: layer[%u] ratio=%u%% bitrate=%u(of %ld)",
-                    i, currentLayerBitrateRatio, layerBitrates[i], bitrate.target_bitrate);
-        }
-    }
-
-    temporal_layers_config.bIsBitrateRatioValid = OMX_TRUE;
-
-    // Setting layerwise bitrate makes sense only if target bitrate is configured, else defer until later
-    if (bitrate.target_bitrate > 0) {
-        if (!venc_set_layer_bitrates((OMX_U32 *)layerBitrates, numLayers)) {
-            DEBUG_PRINT_ERROR("TemporalLayer: Failed to set layer bitrate");
-            return OMX_ErrorUnsupportedSetting;
-        }
-    } else {
-        DEBUG_PRINT_HIGH("TemporalLayer: Defer setting layerwise bitrate since target bitrate is not yet set");
-    }
-
-    return OMX_ErrorNone;
-}
-
-bool venc_dev::venc_validate_temporal_settings() {
-
-    if (intra_period.num_bframes > 0 || intra_period.num_pframes == 0) {
-        DEBUG_PRINT_HIGH("TemporalLayer: Invalid P-frame/B-frame settings for Hier layers");
-        return false;
-    }
-    return true;
-}
-
-bool venc_dev::venc_validate_temporal_extn(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE &temporal_settings) {
-
-    if (m_sVenc_cfg.codectype != V4L2_PIX_FMT_H264 && m_sVenc_cfg.codectype != V4L2_PIX_FMT_HEVC &&
-        temporal_settings.nPLayerCountActual > 1) {
-        DEBUG_PRINT_LOW("TemporalLayer: Layer encoding supported for H264 & HEVC");
-        return false;
-    }
-
-    if (!venc_validate_range(V4L2_CID_MPEG_VIDC_VIDEO_HIER_B_NUM_LAYERS, temporal_settings.nBLayerCountMax - 1) &&
-        (temporal_settings.nBLayerCountMax > 0)) {
-        DEBUG_PRINT_INFO("WARN: TemporalLayer: Invalid settings, hardware doesn't"
-                    " support %u HB layers", temporal_settings.nBLayerCountMax);
-        return false;
-    }
-
-    if (!venc_validate_range(V4L2_CID_MPEG_VIDC_VIDEO_HIER_P_NUM_LAYERS, temporal_settings.nLayerCountMax - 1) &&
-        !venc_validate_range(V4L2_CID_MPEG_VIDC_VIDEO_HYBRID_HIERP_MODE, temporal_settings.nLayerCountMax - 1)) {
-        DEBUG_PRINT_INFO("WARN: TemporalLayer: Invalid settings, hardware doesn't"
-                    " support %u temporal layers", temporal_settings.nLayerCountMax);
-        return false;
-    }
-
-    if (temporal_settings.nPLayerCountActual > temporal_settings.nLayerCountMax) {
-        DEBUG_PRINT_HIGH("TemporalLayer: Invalid num of max layers");
-        return false;
-    }
-
-    if (temporal_settings.ePattern != OMX_VIDEO_AndroidTemporalLayeringPatternAndroid) {
-        DEBUG_PRINT_LOW("TemporalLayer: The pattern must be Android for Hybrid HP");
-        return false;
-    }
-
-    if ((streaming[CAPTURE_PORT] == true || streaming[OUTPUT_PORT] == true) && (temporal_layers_config.hier_mode == HIER_P_HYBRID)) {
-        DEBUG_PRINT_HIGH("TemporalLayer: Cannot change Hybrid HP settings during streaming");
-        return false;
-    }
-
-    if ((streaming[CAPTURE_PORT] == true || streaming[OUTPUT_PORT] == true) &&
-        ((temporal_settings.nPLayerCountActual > temporal_layers_config.nMaxLayers) ||
-         (temporal_settings.nLayerCountMax    != temporal_layers_config.nMaxLayers))) {
-        DEBUG_PRINT_HIGH("TemporalLayer: Invalid value for Layer count during streaming");
-        return false;
-    }
-
-    return true;
-}
-
-OMX_ERRORTYPE venc_dev::venc_set_temporal_settings(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE &temporal_settings) {
-
-    if (venc_find_hier_type(temporal_settings) == HIER_P) {
-
-        if (venc_disable_hhp() != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-        if (venc_set_hp(temporal_settings) != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-        if (venc_set_bitrate_ratio(temporal_settings) != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-
-
-    } else if (venc_find_hier_type(temporal_settings) == HIER_P_HYBRID) {
-
-        if (venc_disable_hp() != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-        if (venc_set_hhp(temporal_settings) != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-        if (venc_set_bitrate_ratio(temporal_settings) != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-
-    } else {
-
-        if (venc_disable_hhp() != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-        if (venc_disable_hp() != OMX_ErrorNone) {
-            return OMX_ErrorUnsupportedSetting;
-        }
-        memset(&temporal_layers_config, 0x0, sizeof(temporal_layers_config));
-    }
-
-    return OMX_ErrorNone;
-}
-
-void venc_dev::venc_copy_temporal_settings(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE &temporalParams) {
-
-    OMX_U32 previousLayersAccumulatedBitrateRatio = 0;
-    memset(&temporal_layers_config, 0x0, sizeof(temporal_layers_config));
-
-    temporal_layers_config.nMaxLayers           = temporalParams.nLayerCountMax ;
-    temporal_layers_config.nMaxBLayers          = temporalParams.nBLayerCountMax ;
-    temporal_layers_config.ePattern             = temporalParams.ePattern;
-    temporal_layers_config.nPLayers             = temporalParams.nPLayerCountActual;
-    temporal_layers_config.nBLayers             = temporalParams.nBLayerCountActual;
-    temporal_layers_config.bIsBitrateRatioValid = temporalParams.bBitrateRatiosSpecified;
-
-    if (temporalParams.bBitrateRatiosSpecified == OMX_TRUE) {
-        for (OMX_U32 i = 0; i < temporalParams.nPLayerCountActual + temporalParams.nBLayerCountActual; ++i) {
-            previousLayersAccumulatedBitrateRatio = (i == 0) ? 0 : temporalParams.nBitrateRatios[i-1];
-            temporal_layers_config.nTemporalLayerBitrateRatio[i] = temporalParams.nBitrateRatios[i];
-            temporal_layers_config.nTemporalLayerBitrateFraction[i] =
-                    temporalParams.nBitrateRatios[i] - previousLayersAccumulatedBitrateRatio;
-        }
-    }
-
-    if (temporalParams.nPLayerCountActual <= 1 ||
-        temporalParams.ePattern == OMX_VIDEO_AndroidTemporalLayeringPatternNone) {
-        client_req_disable_temporal_layers = true;
-    } else {
-        client_req_disable_temporal_layers = false;
-    }
-}
-
-bool venc_dev::venc_reconfigure_temporal_settings() {
-
-    OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE temporalParams;
-    memset(&temporalParams, 0x0, sizeof(OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE));
-
-    DEBUG_PRINT_HIGH("TemporalLayer: Reconfigure temporal layer settings");
-
-    if (!venc_validate_temporal_settings()) {
-        DEBUG_PRINT_HIGH("TemporalLayer: Cannot enable temporal layers");
-        return true;
-    }
-
-    temporalParams.nLayerCountMax           = temporal_layers_config.nMaxLayers;
-    temporalParams.nBLayerCountMax          = temporal_layers_config.nMaxBLayers;
-    temporalParams.ePattern                 = temporal_layers_config.ePattern;
-    temporalParams.nPLayerCountActual       = temporal_layers_config.nPLayers;
-    temporalParams.nBLayerCountActual       = temporal_layers_config.nBLayers;
-    temporalParams.bBitrateRatiosSpecified  = temporal_layers_config.bIsBitrateRatioValid;
-
-    if (temporal_layers_config.bIsBitrateRatioValid == OMX_TRUE) {
-        for (OMX_U32 i = 0; i < temporal_layers_config.nPLayers + temporal_layers_config.nBLayers; ++i) {
-            temporalParams.nBitrateRatios[i] =
-                    temporal_layers_config.nTemporalLayerBitrateRatio[i];
-        }
-    }
-
-    if (venc_set_temporal_settings(temporalParams) != OMX_ErrorNone) {
-        DEBUG_PRINT_ERROR("TemporalLayer: Failed to set temporal settings");
-        return false;
-    }
-
-    return true;
-}
-
-bool venc_dev::venc_reconfigure_ltrmode() {
-
-    if ((ltrinfo.enabled == true) && (temporal_layers_config.hier_mode == HIER_P_HYBRID) &&
-            (temporal_layers_config.nPLayers > 1)) {
-
-        if (!venc_set_ltrmode(0, 0)) {
-            DEBUG_PRINT_ERROR("Failed to disable LTR when HybridHP is enabled");
-            return false;
-        }
-    }
-    return true;
+	return OMX_ErrorNone;
 }
 
 bool venc_dev::venc_get_hevc_profile(OMX_U32* profile)
@@ -7257,48 +4191,6 @@ bool venc_dev::venc_get_hevc_profile(OMX_U32* profile)
             return true;
         } else return false;
     } else return false;
-}
-
-void venc_dev::venc_get_consumer_usage(OMX_U32* usage) {
-
-    OMX_U32 eProfile = 0;
-    bool hevc = venc_get_hevc_profile(&eProfile);
-
-    /* Initialize to zero & update as per required color format */
-    *usage = 0;
-
-#ifndef DISABLE_UBWC
-    /* Configure UBWC as default */
-    *usage |= GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
-#endif
-
-    if (hevc &&
-       (eProfile == (OMX_U32)OMX_VIDEO_HEVCProfileMain10HDR10 ||
-        eProfile == (OMX_U32)OMX_VIDEO_HEVCProfileMain10)) {
-        DEBUG_PRINT_INFO("Setting 10-bit consumer usage bits");
-        *usage |= GRALLOC_USAGE_PRIVATE_10BIT_VIDEO;
-        if (mUseLinearColorFormat & REQUEST_LINEAR_COLOR_10_BIT) {
-            *usage &= ~GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
-            DEBUG_PRINT_INFO("Clear UBWC consumer usage bits as 10-bit linear color requested");
-        }
-    } else if (mUseLinearColorFormat & REQUEST_LINEAR_COLOR_8_BIT) {
-        *usage &= ~GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
-        DEBUG_PRINT_INFO("Clear UBWC consumer usage bits as 8-bit linear color requested");
-    }
-
-    if (m_codec == OMX_VIDEO_CodingImageHEIC) {
-        DEBUG_PRINT_INFO("Clear UBWC and set HEIF consumer usage bit");
-        *usage &= ~GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
-        *usage |= GRALLOC_USAGE_PRIVATE_HEIF_VIDEO;
-    }
-
-    if (!strncmp(m_platform_name, "trinket", 7)) {
-        if (m_sVenc_cfg.input_width < 640 || m_sVenc_cfg.input_height < 480) {
-            *usage &= ~GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
-        }
-    }
-
-    DEBUG_PRINT_INFO("venc_get_consumer_usage 0x%x", *usage);
 }
 
 bool venc_dev::venc_get_profile_level(OMX_U32 *eProfile,OMX_U32 *eLevel)
@@ -7433,13 +4325,13 @@ bool venc_dev::venc_get_profile_level(OMX_U32 *eProfile,OMX_U32 *eLevel)
         }
     } else if (m_sVenc_cfg.codectype == V4L2_PIX_FMT_HEVC) {
         switch (codec_profile.profile) {
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN:
+            case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN:
                 *eProfile = OMX_VIDEO_HEVCProfileMain;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN10:
+            case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10:
                 *eProfile = OMX_VIDEO_HEVCProfileMain10HDR10;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN_STILL_PIC:
+            case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE:
                 *eProfile = OMX_VIDEO_HEVCProfileMainStill;
                 break;
             default:
@@ -7452,80 +4344,57 @@ bool venc_dev::venc_get_profile_level(OMX_U32 *eProfile,OMX_U32 *eLevel)
         }
 
         switch (profile_level.level) {
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_1:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel1;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_1:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel1:OMX_VIDEO_HEVCHighTierLevel1;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_1:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel1;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_2:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel2:OMX_VIDEO_HEVCHighTierLevel2;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_2:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel2;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_2_1:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel21:OMX_VIDEO_HEVCHighTierLevel21;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_2:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel2;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_3:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel3:OMX_VIDEO_HEVCHighTierLevel3;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_2_1:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel21;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_3_1:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel31:OMX_VIDEO_HEVCHighTierLevel31;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_2_1:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel21;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_4:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel4:OMX_VIDEO_HEVCHighTierLevel4;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_3:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel3;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_4_1:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel41:OMX_VIDEO_HEVCHighTierLevel41;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_3:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel3;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_5:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel5:OMX_VIDEO_HEVCHighTierLevel5;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_3_1:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel31;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel51:OMX_VIDEO_HEVCHighTierLevel51;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_3_1:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel31;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_5_2:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel52:OMX_VIDEO_HEVCHighTierLevel52;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_4:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel4;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_6:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel6:OMX_VIDEO_HEVCHighTierLevel6;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_4:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel4;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_6_1:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel61:OMX_VIDEO_HEVCHighTierLevel61;
                 break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_4_1:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel41;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_4_1:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel41;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_5:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel5;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_5:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel5;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_5_1:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel51;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_5_1:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel51;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_5_2:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel52;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_5_2:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel52;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_6:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel6;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_6:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel6;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_6_1:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel61;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_6_1:
-                *eLevel = OMX_VIDEO_HEVCHighTierLevel61;
-                break;
-            case V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_MAIN_TIER_LEVEL_6_2:
-                *eLevel = OMX_VIDEO_HEVCMainTierLevel62;
+            case V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2:
+                *eLevel = (profile_level.tier == V4L2_MPEG_VIDEO_HEVC_TIER_MAIN)?
+                                     OMX_VIDEO_HEVCMainTierLevel62:OMX_VIDEO_HEVCHighTierLevel62;
                 break;
             default:
                 *eLevel = OMX_VIDEO_HEVCHighTiermax;
@@ -7538,40 +4407,266 @@ bool venc_dev::venc_get_profile_level(OMX_U32 *eProfile,OMX_U32 *eLevel)
 }
 
 bool venc_dev::venc_set_nal_size (OMX_VIDEO_CONFIG_NALSIZE *nalSizeInfo) {
-    struct v4l2_control gControl;
     struct v4l2_control sControl;
 
     DEBUG_PRINT_HIGH("set video stream format - nal size - %u", nalSizeInfo->nNaluBytes);
-    gControl.id = V4L2_CID_MPEG_VIDC_VIDEO_STREAM_FORMAT;
 
-    if (ioctl(m_nDriver_fd, VIDIOC_G_CTRL, &gControl)) {
-        DEBUG_PRINT_ERROR("get control: video stream format failed");
+    sControl.id = V4L2_CID_MPEG_VIDEO_HEVC_SIZE_OF_LENGTH_FIELD;
+    switch (nalSizeInfo->nNaluBytes) {
+        case 0:
+            sControl.value = V4L2_MPEG_VIDEO_HEVC_SIZE_0;
+            break;
+        case 4:
+            sControl.value = V4L2_MPEG_VIDEO_HEVC_SIZE_4;
+            break;
+        default:
+            return false;
+    }
+
+    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &sControl)) {
+        DEBUG_PRINT_ERROR("set control: video stream format failed - %u",
+                (unsigned int)nalSizeInfo->nNaluBytes);
+        return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_superframe_enable(private_handle_t *handle)
+{
+    struct v4l2_control ctrl;
+    OMX_U32 frame_size;
+    unsigned long color_format;
+
+    ctrl.id = V4L2_CID_MPEG_VIDC_SUPERFRAME;
+    color_format = get_media_colorformat(m_sVenc_cfg.inputformat);
+    frame_size = VENUS_BUFFER_SIZE(color_format, m_sVenc_cfg.input_width, m_sVenc_cfg.input_height);
+
+    /*
+    * disable superframe if handle->size is not multiple of
+    * frame_size or if it is a single frame.
+    */
+    if (handle->size % frame_size || handle->size == frame_size) {
+        DEBUG_PRINT_ERROR("Invalid superframe handle size %d for frame size %d",
+            handle->size, frame_size);
+        return false;
+    }
+    ctrl.value = handle->size / frame_size;
+    DEBUG_PRINT_HIGH("venc_superframe_enable: %d", ctrl.value);
+    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &ctrl)) {
+        DEBUG_PRINT_ERROR("Failed to enable superframe, errno %d", errno);
+        return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_cvp_enable(private_handle_t *handle)
+{
+    cvpMetadata.size = 0;
+    if (temporal_layers_config.nMaxLayers > 1) {
+        DEBUG_PRINT_INFO("venc_cvp_enable: disabling CVP as max layers %u", temporal_layers_config.nMaxLayers);
+        return true;
+    }
+    if (getMetaData(handle, GET_CVP_METADATA, &cvpMetadata) == 0) {
+        if (cvpMetadata.size == CVP_METADATA_SIZE) {
+            struct v4l2_control control;
+            control.id = V4L2_CID_MPEG_VIDC_VIDEO_EXTRADATA;
+            control.value = EXTRADATA_ENC_INPUT_CVP;
+            if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &control)) {
+                DEBUG_PRINT_ERROR("ERROR: Setting CVP metadata extradata control failed");
+                return false;
+            }
+            m_cvp_meta_enabled = true;
+            m_cvp_first_metadata = true;
+            DEBUG_PRINT_HIGH("CVP metadata enabled");
+            if (!venc_set_cvp_skipratio_controls())
+                return false;
+        } else {
+            DEBUG_PRINT_ERROR("ERROR: External CVP mode disabled for this session and continue!");
+            setMetaData(handle, SET_CVP_METADATA, 0);
+        }
+    } else {
+        DEBUG_PRINT_INFO("venc_cvp_enable: cvp metadata not available");
+    }
+    return true;
+}
+
+bool venc_dev::venc_set_cvp_skipratio_controls()
+{
+    struct v4l2_control ctrl;
+
+    if (!cvpMetadata.cvp_frame_rate || !cvpMetadata.capture_frame_rate) {
+        DEBUG_PRINT_ERROR("ERROR: Invalid cvp frame rate received");
+        return true;
+    }
+    DEBUG_PRINT_HIGH("cvpMetadata: frame_rate %u capture rate %u", cvpMetadata.cvp_frame_rate, cvpMetadata.capture_frame_rate);
+
+    ctrl.id = V4L2_CID_MPEG_VIDC_CAPTURE_FRAME_RATE;
+    ctrl.value = cvpMetadata.capture_frame_rate;
+    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &ctrl)) {
+        DEBUG_PRINT_ERROR("ERROR: Setting capture frame rate control failed");
         return false;
     }
 
-    sControl.id = V4L2_CID_MPEG_VIDC_VIDEO_STREAM_FORMAT;
-    switch (nalSizeInfo->nNaluBytes) {
-            case 0:
-                sControl.value = V4L2_MPEG_VIDC_VIDEO_NAL_FORMAT_STARTCODES;
-                break;
-            case 4:
-                sControl.value = V4L2_MPEG_VIDC_VIDEO_NAL_FORMAT_FOUR_BYTE_LENGTH;
-                break;
-            default:
-                return false;
-        }
+    ctrl.id = V4L2_CID_MPEG_VIDC_CVP_FRAME_RATE;
+    ctrl.value = cvpMetadata.cvp_frame_rate;
+    if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &ctrl)) {
+        DEBUG_PRINT_ERROR("ERROR: Setting cvp frame rate control failed");
+        return false;
+    }
+    return true;
+}
 
-    if ((1 << sControl.value) & gControl.value) {
-        if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &sControl)) {
-            DEBUG_PRINT_ERROR("set control: video stream format failed - %u",
-                    (unsigned int)nalSizeInfo->nNaluBytes);
+bool venc_dev::venc_get_cvp_metadata(private_handle_t *handle, struct v4l2_buffer *buf)
+{
+    if (!m_cvp_meta_enabled)
+        return true;
+
+    unsigned int capture_rate = cvpMetadata.capture_frame_rate;
+    unsigned int cvp_rate = cvpMetadata.cvp_frame_rate;
+
+    buf->flags &= ~V4L2_BUF_FLAG_CVPMETADATA_SKIP;
+    cvpMetadata.size = 0;
+    if (getMetaData(handle, GET_CVP_METADATA, &cvpMetadata) == 0) {
+        setMetaData(handle, SET_CVP_METADATA, 0);
+        if (cvpMetadata.size != CVP_METADATA_SIZE) {
+            DEBUG_PRINT_ERROR("ERROR: Invalid CVP metadata size %d",
+                cvpMetadata.size);
+            cvpMetadata.size = 0;
+            /* If camera sends metadata of size not matching to CVP_METADATA_SIZE,
+               it is considered as an error case. So, do not add skip flag */
             return false;
         }
-        return true;
+        DEBUG_PRINT_LOW("CVP metadata size %d", cvpMetadata.size);
+        if (m_debug.cvp_log) {
+            venc_cvp_log_buffers("CVP", cvpMetadata.size, cvpMetadata.payload);
+        }
+    } else {
+        DEBUG_PRINT_ERROR("ERROR: CVP metadata not available");
+        return false;
     }
 
-    return false;
+    if (m_cvp_first_metadata) {
+        m_cvp_first_metadata = false;
+    } else if (cvpMetadata.flags & CVP_METADATA_FLAG_REPEAT) {
+        buf->flags |= V4L2_BUF_FLAG_CVPMETADATA_SKIP;
+        DEBUG_PRINT_LOW("venc_empty_buf: V4L2_BUF_FLAG_CVPMETADATA_SKIP is set");
+    }
 
+    if ((cvpMetadata.capture_frame_rate != capture_rate) ||
+        (cvpMetadata.cvp_frame_rate != cvp_rate)) {
+        if(!venc_set_cvp_skipratio_controls())
+            return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_config_bitrate(OMX_VIDEO_CONFIG_BITRATETYPE *bit_rate)
+{
+    OMX_U32 bitrate = bit_rate->nEncodeBitrate;
+    if (bit_rate->nPortIndex == (OMX_U32)PORT_INDEX_OUT) {
+        // If quality boost is eligible, also increase bitrate by 15% in dynamic change case
+        if (mQualityBoostEligible && bitrate < VENC_QUALITY_BOOST_BITRATE_THRESHOLD) {
+            bitrate += bitrate * 15 / 100;
+        }
+        if (venc_set_target_bitrate(bitrate) == false) {
+            DEBUG_PRINT_ERROR("ERROR: Setting Target Bit rate failed");
+            return false;
+        }
+    } else {
+        DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoBitrate");
+        return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_config_framerate(OMX_CONFIG_FRAMERATETYPE *frame_rate)
+{
+    if (frame_rate->nPortIndex == (OMX_U32)PORT_INDEX_OUT) {
+        if (venc_set_encode_framerate(frame_rate->xEncodeFramerate) == false) {
+            DEBUG_PRINT_ERROR("ERROR: Setting Encode Framerate failed");
+            return false;
+        }
+    } else {
+        DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoFramerate");
+        return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_config_intravoprefresh(OMX_CONFIG_INTRAREFRESHVOPTYPE *intra_vop_refresh)
+{
+    if (intra_vop_refresh->nPortIndex == (OMX_U32)PORT_INDEX_OUT) {
+        if (venc_set_intra_vop_refresh(intra_vop_refresh->IntraRefreshVOP) == false) {
+            DEBUG_PRINT_ERROR("ERROR: Setting Encode Framerate failed");
+            return false;
+        }
+    } else {
+        DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoFramerate");
+        return false;
+    }
+
+    return true;
+}
+
+bool venc_dev::venc_config_markLTR(OMX_QCOM_VIDEO_CONFIG_LTRMARK_TYPE *markltr)
+{
+    if (markltr->nPortIndex == (OMX_U32)PORT_INDEX_IN) {
+        if(venc_set_markltr(markltr->nID) == false) {
+            DEBUG_PRINT_ERROR("ERROR: Mark LTR failed");
+            return false;
+        }
+    }  else {
+        DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_QcomIndexConfigVideoLTRMark");
+        return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_config_useLTR(OMX_QCOM_VIDEO_CONFIG_LTRUSE_TYPE *useltr)
+{
+    if (useltr->nPortIndex == (OMX_U32)PORT_INDEX_IN) {
+        if(venc_set_useltr(useltr->nID) == false) {
+            DEBUG_PRINT_ERROR("ERROR: Use LTR failed");
+            return false;
+        }
+    } else {
+        DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_QcomIndexConfigVideoLTRUse");
+        return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_config_qp(OMX_SKYPE_VIDEO_CONFIG_QP *configqp)
+{
+    if (venc_set_qp(configqp->nQP,
+                    configqp->nQP,
+                    configqp->nQP,
+                    ENABLE_I_QP | ENABLE_P_QP | ENABLE_B_QP ) == false) {
+        DEBUG_PRINT_ERROR("Failed to set OMX_QcomIndexConfigQp failed");
+        return false;
+    }
+    return true;
+}
+
+bool venc_dev::venc_config_vp8refframe(OMX_VIDEO_VP8REFERENCEFRAMETYPE *vp8refframe)
+{
+    if ((vp8refframe->nPortIndex == (OMX_U32)PORT_INDEX_IN) &&
+            (vp8refframe->bUseGoldenFrame)) {
+        if(venc_set_useltr(0x1) == false) {
+            DEBUG_PRINT_ERROR("ERROR: use goldenframe failed");
+            return false;
+        }
+    } else if((vp8refframe->nPortIndex == (OMX_U32)PORT_INDEX_IN) &&
+            (vp8refframe->bGoldenFrameRefresh)) {
+        if(venc_set_markltr(0x1) == false) {
+            DEBUG_PRINT_ERROR("ERROR: Setting goldenframe failed");
+            return false;
+        }
+    } else {
+        DEBUG_PRINT_ERROR("ERROR: Invalid Port Index for OMX_IndexConfigVideoVp8ReferenceFrame");
+        return false;
+    }
+    return true;
 }
 
 #ifdef _ANDROID_ICS_
@@ -7651,165 +4746,53 @@ bool venc_dev::BatchInfo::isPending(int bufferId) {
 bool venc_dev::venc_set_hdr_info(const MasteringDisplay& mastering_disp_info,
                             const ContentLightLevel& content_light_level_info)
 {
-    struct v4l2_ext_control ctrl[13];
-    struct v4l2_ext_controls controls;
-    const unsigned int RGB_PRIMARY_TABLE[] = {
-        V4L2_CID_MPEG_VIDC_VENC_RGB_PRIMARY_00,
-        V4L2_CID_MPEG_VIDC_VENC_RGB_PRIMARY_01,
-        V4L2_CID_MPEG_VIDC_VENC_RGB_PRIMARY_10,
-        V4L2_CID_MPEG_VIDC_VENC_RGB_PRIMARY_11,
-        V4L2_CID_MPEG_VIDC_VENC_RGB_PRIMARY_20,
-        V4L2_CID_MPEG_VIDC_VENC_RGB_PRIMARY_21,
+    struct v4l2_control ctrl = {0, 0};
+    const unsigned int hdr_info[] = {
+        MSM_VIDC_RGB_PRIMARY_00,
+        MSM_VIDC_RGB_PRIMARY_01,
+        MSM_VIDC_RGB_PRIMARY_10,
+        MSM_VIDC_RGB_PRIMARY_11,
+        MSM_VIDC_RGB_PRIMARY_20,
+        MSM_VIDC_RGB_PRIMARY_21,
+        MSM_VIDC_WHITEPOINT_X,
+        MSM_VIDC_WHITEPOINT_Y,
+        MSM_VIDC_MAX_DISP_LUM,
+        MSM_VIDC_MIN_DISP_LUM,
+        MSM_VIDC_RGB_MAX_CLL,
+        MSM_VIDC_RGB_MAX_FLL
     };
 
-    memset(&controls, 0, sizeof(controls));
-    memset(ctrl, 0, sizeof(ctrl));
+    unsigned int values[] = {
+        mastering_disp_info.primaries.rgbPrimaries[0][0],
+        mastering_disp_info.primaries.rgbPrimaries[0][1],
+        mastering_disp_info.primaries.rgbPrimaries[1][0],
+        mastering_disp_info.primaries.rgbPrimaries[1][1],
+        mastering_disp_info.primaries.rgbPrimaries[2][0],
+        mastering_disp_info.primaries.rgbPrimaries[2][1],
+        mastering_disp_info.primaries.whitePoint[0],
+        mastering_disp_info.primaries.whitePoint[1],
+        // maxDisplayLuminance is in cd/m^2 scale. But the standard requires this field
+        // to be in 0.0001 cd/m^2 scale. So, multiply with LUMINANCE_MULTIPLICATION_FACTOR
+        // and give to be driver
+        mastering_disp_info.maxDisplayLuminance * LUMINANCE_MULTIPLICATION_FACTOR,
+        mastering_disp_info.minDisplayLuminance,
+        content_light_level_info.maxContentLightLevel,
+        content_light_level_info.minPicAverageLightLevel
+    };
 
-    controls.count = 11;
-    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-    controls.controls = ctrl;
+    ctrl.id = V4L2_CID_MPEG_VIDC_VENC_HDR_INFO;
 
-    ctrl[0].id = V4L2_CID_MPEG_VIDC_VENC_HDR_INFO;
-    ctrl[0].value = V4L2_MPEG_MSM_VIDC_ENABLE;
-
-    /* ctrl[1] - ctrl[6] */
-    for (int i = 0; i < 3; i++) {
-        int first_idx = 2*i+1;
-        int second_idx = 2*i+2;
-        ctrl[first_idx].id = RGB_PRIMARY_TABLE[first_idx-1];
-        ctrl[first_idx].value = mastering_disp_info.primaries.rgbPrimaries[i][0];
-
-        ctrl[second_idx].id = RGB_PRIMARY_TABLE[second_idx-1];
-        ctrl[second_idx].value = mastering_disp_info.primaries.rgbPrimaries[i][1];
-    }
-
-    ctrl[7].id = V4L2_CID_MPEG_VIDC_VENC_WHITEPOINT_X;
-    ctrl[7].value = mastering_disp_info.primaries.whitePoint[0];
-
-    ctrl[8].id = V4L2_CID_MPEG_VIDC_VENC_WHITEPOINT_Y;
-    ctrl[8].value = mastering_disp_info.primaries.whitePoint[1];
-
-    ctrl[9].id = V4L2_CID_MPEG_VIDC_VENC_MAX_DISP_LUM;
-    // maxDisplayLuminance is in cd/m^2 scale. But the standard requires this field
-    // to be in 0.0001 cd/m^2 scale. So, multiply with LUMINANCE_MULTIPLICATION_FACTOR
-    // and give to be driver
-    ctrl[9].value = mastering_disp_info.maxDisplayLuminance * LUMINANCE_MULTIPLICATION_FACTOR;
-
-    ctrl[10].id = V4L2_CID_MPEG_VIDC_VENC_MIN_DISP_LUM;
-    ctrl[10].value = mastering_disp_info.minDisplayLuminance;
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls)) {
-        DEBUG_PRINT_ERROR("VIDIOC_S_EXT_CTRLS failed for HDR Info : Disp SEI");
-        return false;
-    }
-
-    memset(&controls, 0, sizeof(controls));
-    memset(ctrl, 0, sizeof(ctrl));
-
-    controls.count = 3;
-    controls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
-    controls.controls = ctrl;
-
-    ctrl[0].id = V4L2_CID_MPEG_VIDC_VENC_HDR_INFO;
-    ctrl[0].value = V4L2_MPEG_MSM_VIDC_ENABLE;
-
-    ctrl[1].id = V4L2_CID_MPEG_VIDC_VENC_MAX_CLL;
-    ctrl[1].value = content_light_level_info.maxContentLightLevel;
-
-    ctrl[2].id = V4L2_CID_MPEG_VIDC_VENC_MAX_FLL;
-    ctrl[2].value = content_light_level_info.minPicAverageLightLevel;
-
-    if (ioctl(m_nDriver_fd, VIDIOC_S_EXT_CTRLS, &controls)) {
-        DEBUG_PRINT_ERROR("VIDIOC_S_EXT_CTRLS failed for HDR Info : CLL SEI");
-        return false;
+    for (unsigned int i = 0; i < (sizeof(hdr_info)/sizeof(hdr_info[0])); i++) {
+        ctrl.value = (unsigned int) ((values[i] & 0xFFFFFFF ) | (hdr_info[i] << 28));
+        if (ioctl(m_nDriver_fd, VIDIOC_S_CTRL, &ctrl)) {
+            DEBUG_PRINT_ERROR("VIDIOC_S_CTRL failed for HDR Info : (%u) value %#X : %#X",
+                              i, hdr_info[i], values[i]);
+            return false;
+        }
     }
 
     return true;
 }
-
-#ifdef _VQZIP_
-venc_dev::venc_dev_vqzip::venc_dev_vqzip()
-{
-    mLibHandle = NULL;
-    pthread_mutex_init(&lock, NULL);
-}
-
-bool venc_dev::venc_dev_vqzip::init()
-{
-    bool status = true;
-    if (mLibHandle) {
-        DEBUG_PRINT_ERROR("VQZIP init called twice");
-        status = false;
-    }
-    if (status) {
-        mLibHandle = dlopen("libvqzip.so", RTLD_NOW);
-        if (mLibHandle) {
-            mVQZIPInit = (vqzip_init_t)
-                dlsym(mLibHandle,"VQZipInit");
-            mVQZIPDeInit = (vqzip_deinit_t)
-                dlsym(mLibHandle,"VQZipDeInit");
-            mVQZIPComputeStats = (vqzip_compute_stats_t)
-                dlsym(mLibHandle,"VQZipComputeStats");
-            if (!mVQZIPInit || !mVQZIPDeInit || !mVQZIPComputeStats)
-                status = false;
-        } else {
-            DEBUG_PRINT_ERROR("FATAL ERROR: could not dlopen libvqzip.so: %s", dlerror());
-            status = false;
-        }
-        if (status) {
-            mVQZIPHandle = mVQZIPInit();
-        }
-    }
-    if (!status && mLibHandle) {
-        dlclose(mLibHandle);
-        mLibHandle = NULL;
-        mVQZIPHandle = NULL;
-        mVQZIPInit = NULL;
-        mVQZIPDeInit = NULL;
-        mVQZIPComputeStats = NULL;
-    }
-    return status;
-}
-
-int venc_dev::venc_dev_vqzip::fill_stats_data(void* pBuf, void* extraData)
-{
-    VQZipStatus result;
-    VQZipStats *pStats = (VQZipStats *)extraData;
-    pConfig.pSEIPayload = NULL;
-    unsigned long size;
-
-    if (!pBuf || !pStats || !mVQZIPHandle) {
-        DEBUG_PRINT_ERROR("Invalid data passed to stats function");
-    }
-    result = mVQZIPComputeStats(mVQZIPHandle, (void* )pBuf, &pConfig, pStats);
-    return result;
-}
-
-void venc_dev::venc_dev_vqzip::deinit()
-{
-    if (mLibHandle) {
-        pthread_mutex_lock(&lock);
-        dlclose(mLibHandle);
-        mVQZIPDeInit(mVQZIPHandle);
-        mLibHandle = NULL;
-        mVQZIPHandle = NULL;
-        mVQZIPInit = NULL;
-        mVQZIPDeInit = NULL;
-        mVQZIPComputeStats = NULL;
-        pthread_mutex_unlock(&lock);
-    }
-}
-
-venc_dev::venc_dev_vqzip::~venc_dev_vqzip()
-{
-    DEBUG_PRINT_HIGH("Destroy C2D instance");
-    if (mLibHandle) {
-        dlclose(mLibHandle);
-    }
-    mLibHandle = NULL;
-    pthread_mutex_destroy(&lock);
-}
-#endif
 
 /*=================================================================================
  * Function:   venc_set_roi_region_qp_info
@@ -7823,9 +4806,9 @@ venc_dev::venc_dev_vqzip::~venc_dev_vqzip()
 *==================================================================================*/
 bool venc_dev::venc_set_roi_region_qp_info(OMX_QTI_VIDEO_CONFIG_ROI_RECT_REGION_INFO *roiRegionInfo)
 {
-    if (!m_roi_enabled || (m_roi_type == 0)) {
-        DEBUG_PRINT_ERROR("ROI-Region: roi is invalid (enable:%u, type:%d)",
-                m_roi_enabled, m_roi_type);
+    if (!m_roi_enabled || m_roi_type == ROI_NONE) {
+        DEBUG_PRINT_ERROR("ROI-Region: roi info not enabled (%d) or unknown roi type (%u)",
+            m_roi_enabled, m_roi_type);
         return false;
     }
     if (!roiRegionInfo) {
@@ -7893,10 +4876,10 @@ OMX_U32 venc_dev::append_extradata_roi_region_qp_info(OMX_OTHER_EXTRADATATYPE *d
     OMX_U32 numBytes, mbLeft, mbTop, mbRight, mbBottom = 0;
     OMX_S8 deltaQP = 0;
     DEBUG_PRINT_LOW("ROI-Region: clip(%ux%u: %s), mb(%ux%u), region(num:%u, ts:%lld)",
-            width, height, isHevc ? "hevc" : "avc",
-            mbRow, mbCol, regionInfo.nRegionNum, regionInfo.nTimeStamp);
+            width, height, isHevc ? "hevc" : "avc", mbRow, mbCol, regionInfo.nRegionNum,
+            regionInfo.nTimeStamp);
 
-    if (m_roi_type == V4L2_CID_MPEG_VIDC_VIDEO_ROI_TYPE_2BYTE) {
+    if (m_roi_type == ROI_2BYTE) {
         OMX_U32 mbRowAligned = ALIGN(mbRow, 8);
         numBytes = mbRowAligned * mbCol * 2;
         OMX_U32 numBytesAligned = ALIGN(numBytes, 4);
@@ -7906,7 +4889,7 @@ OMX_U32 venc_dev::append_extradata_roi_region_qp_info(OMX_OTHER_EXTRADATATYPE *d
         data->nSize = ALIGN(sizeof(OMX_OTHER_EXTRADATATYPE) + data->nDataSize, 4);
         if (data->nSize > freeSize) {
             DEBUG_PRINT_ERROR("ROI-Region: Buffer size(%u) is less than ROI extradata size(%u)",
-                    freeSize, data->nSize);
+                     freeSize, data->nSize);
             data->nDataSize = 0;
             data->nSize = 0;
             return 0;
@@ -7939,12 +4922,12 @@ OMX_U32 venc_dev::append_extradata_roi_region_qp_info(OMX_OTHER_EXTRADATATYPE *d
                 for (OMX_U32 col = mbLeft; col <= mbRight; col++) {
                     mb = row * mbRowAligned + col;
                     pData = exDataBuf + mb;
-                    *pData = (1 << 11) | ((deltaQP & 0x3F) << 4);
+                   *pData = (1 << 11) | ((deltaQP & 0x3F) << 4);
                 }
             }
         }
         DEBUG_PRINT_LOW("ROI-Region(2Byte): set roi: raw size: %u", numBytesAligned);
-    } else if (m_roi_type == V4L2_CID_MPEG_VIDC_VIDEO_ROI_TYPE_2BIT) {
+    } else if (m_roi_type == ROI_2BIT) {
         numBytes = (mbRow * mbCol * 2 + 7) >> 3;
         data->nDataSize = sizeof(struct msm_vidc_roi_qp_payload) + numBytes;
         data->nSize = ALIGN(sizeof(OMX_OTHER_EXTRADATATYPE) + data->nDataSize, 4);
@@ -8009,7 +4992,62 @@ OMX_U32 venc_dev::append_extradata_roi_region_qp_info(OMX_OTHER_EXTRADATATYPE *d
             }
         }
         DEBUG_PRINT_LOW("ROI-Region(2Bit):set roi low:%d,up:%d", roiData->lower_qp_offset, roiData->upper_qp_offset);
+    } else {
+        DEBUG_PRINT_ERROR("Invalied roi type : %u", m_roi_type);
+        return 0;
     }
     return data->nSize;
 }
 
+void venc_dev::venc_set_quality_boost(OMX_BOOL c2d_enable)
+{
+    OMX_U32 initial_qp;
+    OMX_QCOM_VIDEO_PARAM_IPB_QPRANGETYPE qp_range;
+    OMX_QTI_VIDEO_CONFIG_BLURINFO blurinfo;
+
+    // Conditions to enable encoder quality boost,
+    // 1. Codec is AVC
+    // 2. RCMode is VBR
+    // 3. Input is RGBA/RGBA_UBWC (C2D enabled)
+    // 4. width <= 960 and height <= 960
+    // 5. width >= 400 and height >= 400
+    // 6. FPS <= 30
+    // 7. bitrate < 2Mbps
+
+    if (mQualityBoostRequested && c2d_enable &&
+        m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264 &&
+        rate_ctrl.rcmode == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR &&
+        m_sVenc_cfg.dvs_width <= 960 && m_sVenc_cfg.dvs_height <= 960 &&
+        m_sVenc_cfg.dvs_width >= 400 && m_sVenc_cfg.dvs_height >= 400 &&
+        (m_sVenc_cfg.fps_num / m_sVenc_cfg.fps_den) <= 30 &&
+        bitrate.target_bitrate < VENC_QUALITY_BOOST_BITRATE_THRESHOLD) {
+        mQualityBoostEligible = true;
+        DEBUG_PRINT_HIGH("Quality boost eligible encoder session");
+    } else {
+        return;
+    }
+
+    if (bitrate.target_bitrate <= 64000)
+        venc_set_level(OMX_VIDEO_AVCLevel1);
+
+    // Set below configurations to boost quality
+    // 1. Increase bitrate by 15%
+    bitrate.target_bitrate += bitrate.target_bitrate * 15 / 100;
+    venc_set_target_bitrate(bitrate.target_bitrate);
+
+    // 2. Set initial QP=30
+    initial_qp = 30;
+    venc_set_qp(initial_qp, initial_qp, initial_qp, 7);
+
+    // 3. Set QP range [10,40]
+    qp_range.minIQP = qp_range.minPQP = qp_range.minBQP = 10;
+    qp_range.maxIQP = qp_range.maxPQP = qp_range.maxBQP = 40;
+    venc_set_session_qp_range(&qp_range);
+
+    // 4. Disable blur (both external and internal)
+    blurinfo.nBlurInfo = 2;
+    venc_set_blur_resolution(&blurinfo);
+
+    // 5. Disable bitrate savings (CAC)
+    venc_set_bitrate_savings_mode(0);
+}

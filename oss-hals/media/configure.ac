@@ -101,14 +101,6 @@ AC_ARG_ENABLE([build-mm-video],
                 [Enable conditional compile for build mm video [default=no]]),
         [build_mm_video="${enableval}"])
 
-AC_ARG_ENABLE([target-hypervisor],
-	AC_HELP_STRING([--enable-target-hypervisor],
-		[Enable conditional compile for target hypervisor [default=no]]),
-	[target_hypervisor="${enableval}"],
-	target_hypervisor=no)
-
-AM_CONDITIONAL(TARGET_HYPERVISOR, test "x$target_hypervisor" = "xyes")
-
 AC_ARG_WITH([sanitized-headers],
         [AS_HELP_STRING([--with-sanitized-headers=DIR],[location of the sanitized Linux kernel headers])],
         [CPPFLAGS="$CPPFLAGS -I $withval"])
@@ -203,17 +195,10 @@ AC_CONFIG_FILES([ \
         Makefile \
         mm-core/Makefile \
         libc2dcolorconvert/Makefile \
-        libarbitrarybytes/Makefile \
         libplatformconfig/Makefile \
         mm-video-v4l2/Makefile \
         mm-video-v4l2/vidc/Makefile \
         mm-video-v4l2/vidc/venc/Makefile \
         mm-video-v4l2/vidc/vdec/Makefile \
         ])
-AC_OUTPUT
-
-AM_COND_IF( [TARGET_HYPERVISOR], [
-AC_CONFIG_FILES([ \
-        hypv-intercept/Makefile \
-        ])])
 AC_OUTPUT
